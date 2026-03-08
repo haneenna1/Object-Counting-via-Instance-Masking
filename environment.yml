@@ -1,0 +1,40 @@
+name: masked-density-counting
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+
+  # PyTorch (GPU version)
+  - pytorch=2.2
+  - torchvision
+  - torchaudio
+  # - pytorch-cuda=12.1
+
+  # Core scientific stack
+  - numpy
+  - scipy
+  - pandas
+  - scikit-learn
+  - scikit-image
+
+  # Image processing
+  - pillow
+  - opencv
+
+  # Visualization
+  - matplotlib
+  - seaborn
+
+  # Progress + utilities
+  - tqdm
+  - pyyaml
+
+  # pip packages
+  - pip
+  - pip:
+      - albumentations
