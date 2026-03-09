@@ -16,7 +16,7 @@ dependencies:
   # - pytorch-cuda=12.1
 
   # Core scientific stack
-  - numpy
+  - numpy<2.0
   - scipy
   - pandas
   - scikit-learn
