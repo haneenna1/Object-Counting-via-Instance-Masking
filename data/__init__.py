@@ -22,9 +22,3 @@ __all__ = [
     "load_shanghaitech_dataset",
     "ShanghaiTechDataset",
 ]
-
-try:
-    from .dataset import TorchObjectCountingDataset
-    __all__.append("TorchObjectCountingDataset")
-except ImportError:
-    pass
