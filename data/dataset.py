@@ -12,7 +12,6 @@ import torch
 from torch.utils.data import Dataset
 from torchvision.io import read_image
 
-
 from .annotation_types import AnnotationType
 from .density import generate_density
 from .masking import generate_instance_mask
@@ -27,9 +26,12 @@ SegmentationAnnotations = List[np.ndarray]
 
 def _load_image(path: Union[str, Path]) -> torch.Tensor:
     """
-    Load image as tensor (C,H,W) in [0,1].
+    Load image as tensor (3,H,W) in [0,1].
     """
-    return read_image(str(path)).float() / 255.0
+    img = read_image(str(path)).float() / 255.0
+    if img.shape[0] == 1:  # grayscale
+        img = img.repeat(3, 1, 1)
+    return img
 
 def _parse_annotation_type(value: Any) -> AnnotationType:
     if isinstance(value, AnnotationType):
