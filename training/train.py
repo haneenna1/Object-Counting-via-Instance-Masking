@@ -1,9 +1,13 @@
 """
 Minimal training script for density map regression (object counting)
+with logging and training curves.
 """
 
+import json
 import torch
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -37,9 +41,9 @@ def train_one_epoch(model, dataloader, optimizer, device):
 
         total_loss += loss.item() * batch_size
 
-        # count error
-        pred_count = pred_density.sum(dim=(1,2,3))
-        gt_count = gt_density.sum(dim=(1,2,3))
+        # compute counts
+        pred_count = pred_density.sum(dim=(1, 2, 3))
+        gt_count = gt_density.sum(dim=(1, 2, 3))
 
         mae = torch.abs(pred_count - gt_count).sum()
 
@@ -81,20 +85,52 @@ def validate(model, dataloader, device):
     return total_mae / total_samples
 
 
-# -----------------------------
+# ---------------------------------------------------------
+# Plot training curves
+# ---------------------------------------------------------
+def plot_training_curves(history):
+
+    epochs = range(1, len(history["train_loss"]) + 1)
+
+    plt.figure(figsize=(8, 5))
+
+    plt.plot(epochs, history["train_loss"], label="Train Loss")
+    plt.plot(epochs, history["train_mae"], label="Train MAE")
+    plt.plot(epochs, history["val_mae"], label="Validation MAE")
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Metric")
+    plt.title("Training Curves")
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig("training_curves.png")
+    plt.close()
+
+
+# ---------------------------------------------------------
 # Main training function
 # -----------------------------
 def train(model, train_dataset, val_dataset, epochs=100, batch_size=8):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("training on ", device, ",", epochs, "epochs,", batch_size, "batch")
+
+    print(
+        "Training on",
+        device,
+        "| epochs:",
+        epochs,
+        "| batch size:",
+        batch_size,
+    )
+
     model = model.to(device)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True
     )
 
@@ -102,7 +138,7 @@ def train(model, train_dataset, val_dataset, epochs=100, batch_size=8):
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True
     )
 
@@ -110,6 +146,16 @@ def train(model, train_dataset, val_dataset, epochs=100, batch_size=8):
 
     best_mae = float("inf")
 
+    # training history
+    history = {
+        "train_loss": [],
+        "train_mae": [],
+        "val_mae": [],
+    }
+
+    # -----------------------------------------------------
+    # Epoch loop
+    # -----------------------------------------------------
     for epoch in range(1, epochs + 1):
 
         train_loss, train_mae = train_one_epoch(
@@ -125,6 +171,11 @@ def train(model, train_dataset, val_dataset, epochs=100, batch_size=8):
             device
         )
 
+        # store metrics
+        history["train_loss"].append(train_loss)
+        history["train_mae"].append(train_mae)
+        history["val_mae"].append(val_mae)
+
         print(
             f"Epoch {epoch:03d} | "
             f"Loss {train_loss:.4f} | "
@@ -137,3 +188,18 @@ def train(model, train_dataset, val_dataset, epochs=100, batch_size=8):
             best_mae = val_mae
             torch.save(model.state_dict(), "best_model.pth")
             print("Saved best model")
+
+    # -----------------------------------------------------
+    # Save training history
+    # -----------------------------------------------------
+    with open("training_history.json", "w") as f:
+        json.dump(history, f, indent=2)
+
+    # -----------------------------------------------------
+    # Plot curves
+    # -----------------------------------------------------
+    plot_training_curves(history)
+
+    print("Training finished")
+    print("History saved to training_history.json")
+    print("Curves saved to training_curves.png")
