@@ -1,6 +1,6 @@
 """
 Instance mask generation for object counting (masked density / MAE-style training).
-Produces a binary mask (or instance-id map) indicating which pixels belong to annotated instances.
+Produces a binary mask indicating which pixels belong to annotated instances.
 """
 
 import numpy as np
@@ -49,40 +49,6 @@ def _mask_from_dots(shape, points, params) -> np.ndarray:
     return mask
 
 
-def _ids_from_dots(shape, points, params):
-
-    H, W = shape
-    id_map = np.zeros((H, W), dtype=np.int32)
-
-    box_size = params["dot_box_size"]
-    sigma = params["dot_sigma"]
-    sigma_to_box = params["dot_sigma_to_box"]
-
-    if box_size is None:
-        side = max(1, int(round(sigma_to_box * sigma)))
-        box_h = box_w = side
-    elif isinstance(box_size, int):
-        box_h = box_w = box_size
-    else:
-        box_h, box_w = box_size
-
-    half_h, half_w = box_h // 2, box_w // 2
-
-    for i, (x, y) in enumerate(points):
-
-        ix, iy = int(round(x)), int(round(y))
-
-        y1 = max(0, iy - half_h)
-        y2 = min(H, iy - half_h + box_h)
-
-        x1 = max(0, ix - half_w)
-        x2 = min(W, ix - half_w + box_w)
-
-        id_map[y1:y2, x1:x2] = i + 1
-
-    return id_map
-
-
 # ---------------------------------------------------------
 # BBOX HANDLERS
 # ---------------------------------------------------------
@@ -102,22 +68,6 @@ def _mask_from_bboxes(shape, bboxes, params) -> np.ndarray:
             mask[y1:y2, x1:x2] = 1
 
     return mask
-
-
-def _ids_from_bboxes(shape, bboxes, params):
-
-    H, W = shape
-    id_map = np.zeros((H, W), dtype=np.int32)
-
-    for i, (x1, y1, x2, y2) in enumerate(bboxes):
-
-        x1, x2 = int(max(0, x1)), int(min(W, x2))
-        y1, y2 = int(max(0, y1)), int(min(H, y2))
-
-        if x2 > x1 and y2 > y1:
-            id_map[y1:y2, x1:x2] = i + 1
-
-    return id_map
 
 
 # ---------------------------------------------------------
@@ -140,17 +90,6 @@ def _mask_from_segmentations(shape, masks, params) -> np.ndarray:
     return mask
 
 
-def _ids_from_segmentations(shape, masks, params):
-
-    H, W = shape
-    id_map = np.zeros((H, W), dtype=np.int32)
-
-    for i, m in enumerate(masks):
-        id_map[m > 0] = i + 1
-
-    return id_map
-
-
 # ---------------------------------------------------------
 # REGISTRY
 # ---------------------------------------------------------
@@ -159,12 +98,6 @@ MASK_GENERATORS = {
     AnnotationType.DOT: _mask_from_dots,
     AnnotationType.BBOX: _mask_from_bboxes,
     AnnotationType.SEGMENTATION: _mask_from_segmentations,
-}
-
-ID_GENERATORS = {
-    AnnotationType.DOT: _ids_from_dots,
-    AnnotationType.BBOX: _ids_from_bboxes,
-    AnnotationType.SEGMENTATION: _ids_from_segmentations,
 }
 
 
@@ -185,13 +118,10 @@ def generate_instance_mask(
     dot_sigma_to_box: float = 2.0,
     dot_sigma: float = 4.0,
     mask_object_ratio: Optional[float] = None,
-    return_instance_ids: bool = False,
-) -> Union[np.ndarray, Tuple[np.ndarray, Optional[np.ndarray]]]:
-
+) -> np.ndarray:
     """
-    Generate instance mask (binary or instance-id map) from annotations.
+    Generate a binary instance mask from annotations.
     """
-
     anns = list(annotations)
 
     # optional subsampling of objects
@@ -212,10 +142,4 @@ def generate_instance_mask(
     )
 
     mask = MASK_GENERATORS[annotation_type](shape, anns, params)
-
-    if not return_instance_ids:
-        return mask
-
-    id_map = ID_GENERATORS[annotation_type](shape, anns, params)
-
-    return mask, id_map
+    return mask

@@ -67,8 +67,8 @@ class ObjectCountingDataset(Dataset):
         mask_dot_sigma_to_box: float = 2.0,
         mask_dot_sigma: float = 4.0,
         mask_object_ratio: Optional[float] = None,
-        return_instance_ids: bool = False,
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        keep_original_image: bool = False,
     ):
         self.samples = samples
         self.root = Path(root) if root else None
@@ -80,9 +80,9 @@ class ObjectCountingDataset(Dataset):
         self.mask_dot_sigma_to_box = mask_dot_sigma_to_box
         self.mask_dot_sigma = mask_dot_sigma
         self.mask_object_ratio = mask_object_ratio
-        self.return_instance_ids = return_instance_ids
         self.transform = transform
-
+        self.keep_original_image = keep_original_image
+    
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -113,7 +113,7 @@ class ObjectCountingDataset(Dataset):
             fixed_sigma_seg=self.density_fixed_sigma_seg,
         )
 
-        mask_result = generate_instance_mask(
+        mask = generate_instance_mask(
             shape,
             ann_type,
             annotations,
@@ -121,14 +121,7 @@ class ObjectCountingDataset(Dataset):
             dot_sigma_to_box=self.mask_dot_sigma_to_box,
             dot_sigma=self.mask_dot_sigma,
             mask_object_ratio=self.mask_object_ratio,
-            return_instance_ids=self.return_instance_ids,
         )
-
-        if self.return_instance_ids:
-            mask, id_map = mask_result
-        else:
-            mask = mask_result
-            id_map = None
 
         # Convert outputs to tensors
         density = torch.from_numpy(density.astype(np.float32)).unsqueeze(0)
@@ -142,10 +135,14 @@ class ObjectCountingDataset(Dataset):
             "count": torch.tensor(len(annotations), dtype=torch.float32),
         }
 
-        if id_map is not None:
-            out["instance_ids"] = torch.from_numpy(id_map)
-
         if self.transform is not None:
             out = self.transform(out)
+
+        # Keep an unmasked copy for visualization/debugging.
+        if self.keep_original_image:
+            out["original_image"] = out["image"].clone()
+
+        # mask: (1,H,W), image: (3,H,W) -> channel-wise broadcast
+        out["image"] = out["image"] * out["mask"].clamp(0.0, 1.0)
 
         return out
