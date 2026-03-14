@@ -121,11 +121,16 @@ def generate_instance_mask(
 ) -> np.ndarray:
     """
     Generate a binary instance mask from annotations.
+    If mask_object_ratio is None or 0, returns an all-zeros mask (no masking).
     """
+    H, W = shape
+    if mask_object_ratio is None or mask_object_ratio == 0:
+        return np.zeros((H, W), dtype=np.uint8)
+
     anns = list(annotations)
 
     # optional subsampling of objects
-    if mask_object_ratio is not None and len(anns) > 0:
+    if len(anns) > 0:
 
         r = max(0.0, min(1.0, float(mask_object_ratio)))
         k = int(round(r * len(anns)))
