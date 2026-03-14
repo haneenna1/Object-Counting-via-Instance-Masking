@@ -194,8 +194,8 @@ class ObjectCountingDataset(Dataset):
         if self.keep_original_image:
             out["original_image"] = out["image"].clone()
 
-        # mask: (1,H,W), image: (3,H,W) -> channel-wise broadcast
-        out["image"] = out["image"] * out["mask"].clamp(0.0, 1.0)
+        # mask: 1 = hide (object), 0 = show. (1,H,W) * (3,H,W) -> channel-wise broadcast
+        out["image"] = out["image"] * (1.0 - out["mask"].clamp(0.0, 1.0))
 
         return out
 
