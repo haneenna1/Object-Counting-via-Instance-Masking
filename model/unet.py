@@ -23,8 +23,11 @@ class ConvBlock(nn.Module):
 
 class UNetDensity(nn.Module):
 
-    def __init__(self):
+    def __init__(self, *, output_activation: str = "softplus"):
         super().__init__()
+        if output_activation not in ("relu", "softplus", "none"):
+            raise ValueError("output_activation must be 'relu', 'softplus', or 'none'")
+        self._output_activation = output_activation
 
         # Encoder
         self.enc1 = ConvBlock(3, 32)
@@ -44,7 +47,7 @@ class UNetDensity(nn.Module):
         self.up1 = nn.ConvTranspose2d(64, 32, 2, stride=2)
         self.dec1 = ConvBlock(64, 32)
 
-        # Output density map
+        # Output density map; activation (relu/softplus) applied in forward for non-negative density
         self.out = nn.Conv2d(32, 1, 1)
 
     def forward(self, x):
@@ -55,7 +58,6 @@ class UNetDensity(nn.Module):
         e3 = self.enc3(self.pool(e2))
         e4 = self.enc4(self.pool(e3))
 
-        # Decoder
         d3 = self.up3(e4)
         d3 = torch.cat([d3, e3], dim=1)
         d3 = self.dec3(d3)
@@ -69,5 +71,9 @@ class UNetDensity(nn.Module):
         d1 = self.dec1(d1)
 
         density = self.out(d1)
+        if self._output_activation == "relu":
+            density = F.relu(density)
+        elif self._output_activation == "softplus":
+            density = F.softplus(density)
 
         return density
