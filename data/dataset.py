@@ -17,6 +17,10 @@ from .density import generate_density
 from .masking import generate_instance_mask
 
 
+# Sentinel: use per-image default location <image_path>/../density_maps/<stem>_density.npy
+DENSITY_MAP_DIR_AUTO = "auto"
+
+
 # Type aliases for annotations
 DotAnnotations = List[Tuple[float, float]]
 BboxAnnotations = List[Tuple[float, float, float, float]]
@@ -39,6 +43,26 @@ def _parse_annotation_type(value: Any) -> AnnotationType:
     if isinstance(value, str):
         return AnnotationType(value.lower())
     raise ValueError(f"Cannot parse annotation type: {value}")
+
+
+def _density_map_path_for_sample(
+    item: Dict[str, Any],
+    root: Optional[Path],
+    density_map_dir: Union[Path, str],
+) -> Path:
+    """
+    Path to the saved density map .npy file for a sample.
+    If density_map_dir is DENSITY_MAP_DIR_AUTO, uses <image_path>/../density_maps/<stem>_density.npy.
+    Otherwise uses density_map_dir / <stem>_density.npy.
+    """
+    rel = item["image_path"]
+    stem = Path(rel).stem
+    if density_map_dir == DENSITY_MAP_DIR_AUTO:
+        full_image = (root or Path(".")) / rel
+        # <image_path>/../density_maps/<stem>_density.npy
+        out_dir = full_image.parent.parent / "density_maps"
+        return out_dir / f"{stem}_density.npy"
+    return Path(density_map_dir) / f"{stem}_density.npy"
 
 
 class ObjectCountingDataset(Dataset):
@@ -69,6 +93,7 @@ class ObjectCountingDataset(Dataset):
         mask_object_ratio: Optional[float] = None,
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         keep_original_image: bool = False,
+        density_map_dir: Optional[Union[str, Path]] = DENSITY_MAP_DIR_AUTO,
     ):
         self.samples = samples
         self.root = Path(root) if root else None
@@ -82,6 +107,12 @@ class ObjectCountingDataset(Dataset):
         self.mask_object_ratio = mask_object_ratio
         self.transform = transform
         self.keep_original_image = keep_original_image
+        if density_map_dir is None:
+            self.density_map_dir = None
+        elif density_map_dir == DENSITY_MAP_DIR_AUTO:
+            self.density_map_dir = DENSITY_MAP_DIR_AUTO
+        else:
+            self.density_map_dir = Path(density_map_dir)
     
     def __len__(self) -> int:
         return len(self.samples)
@@ -103,15 +134,38 @@ class ObjectCountingDataset(Dataset):
         ann_type = _parse_annotation_type(item["annotation_type"])
         annotations = item["annotations"]
 
-        density = generate_density(
-            shape,
-            ann_type,
-            annotations,
-            sigma=self.density_sigma,
-            sigma_scale_bbox=self.density_sigma_scale_bbox,
-            sigma_from_seg_area=self.density_sigma_from_seg_area,
-            fixed_sigma_seg=self.density_fixed_sigma_seg,
-        )
+        if self.density_map_dir is not None:
+            density_path = _density_map_path_for_sample(
+                item, self.root, self.density_map_dir
+            )
+            if density_path.exists():
+                density = np.load(str(density_path)).astype(np.float32)
+                density = torch.from_numpy(density).unsqueeze(0)
+                print(f"Loaded density map from {density_path}")
+            else:
+                density = generate_density(
+                    shape,
+                    ann_type,
+                    annotations,
+                    sigma=self.density_sigma,
+                    sigma_scale_bbox=self.density_sigma_scale_bbox,
+                    sigma_from_seg_area=self.density_sigma_from_seg_area,
+                    fixed_sigma_seg=self.density_fixed_sigma_seg,
+                )
+                density = torch.from_numpy(density.astype(np.float32)).unsqueeze(0)
+                density_path.parent.mkdir(parents=True, exist_ok=True)
+                np.save(str(density_path), density.squeeze(0).numpy())
+        else:
+            density = generate_density(
+                shape,
+                ann_type,
+                annotations,
+                sigma=self.density_sigma,
+                sigma_scale_bbox=self.density_sigma_scale_bbox,
+                sigma_from_seg_area=self.density_sigma_from_seg_area,
+                fixed_sigma_seg=self.density_fixed_sigma_seg,
+            )
+            density = torch.from_numpy(density.astype(np.float32)).unsqueeze(0)
 
         mask = generate_instance_mask(
             shape,
@@ -123,8 +177,6 @@ class ObjectCountingDataset(Dataset):
             mask_object_ratio=self.mask_object_ratio,
         )
 
-        # Convert outputs to tensors
-        density = torch.from_numpy(density.astype(np.float32)).unsqueeze(0)
         mask = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0)
 
         out = {
@@ -146,3 +198,51 @@ class ObjectCountingDataset(Dataset):
         out["image"] = out["image"] * out["mask"].clamp(0.0, 1.0)
 
         return out
+
+
+def precompute_density_maps(
+    dataset: ObjectCountingDataset,
+    density_map_dir: Optional[Union[str, Path]] = None,
+) -> Union[Path, str]:
+    """
+    Pre-compute and save density maps for all samples so that __getitem__ can load them.
+
+    When density_map_dir is not passed, uses the dataset's density_map_dir (e.g. DENSITY_MAP_DIR_AUTO
+    for per-image default: <image_path>/../density_maps/<stem>_density.npy).
+    Returns the effective directory or DENSITY_MAP_DIR_AUTO when using per-image paths.
+    """
+    effective = (
+        Path(density_map_dir) if density_map_dir is not None and density_map_dir != DENSITY_MAP_DIR_AUTO
+        else (dataset.density_map_dir if dataset.density_map_dir is not None else DENSITY_MAP_DIR_AUTO)
+    )
+    root = dataset.root
+    if effective != DENSITY_MAP_DIR_AUTO:
+        effective.mkdir(parents=True, exist_ok=True)
+
+    for item in dataset.samples:
+        path = _density_map_path_for_sample(item, root, effective)
+        if path.exists():
+            continue
+        image_path = item["image_path"]
+        if root is not None:
+            full_image_path = root / image_path
+        else:
+            full_image_path = Path(image_path)
+        image = _load_image(full_image_path)
+        _, H, W = image.shape
+        shape = (H, W)
+        ann_type = _parse_annotation_type(item["annotation_type"])
+        annotations = item["annotations"]
+        density = generate_density(
+            shape,
+            ann_type,
+            annotations,
+            sigma=dataset.density_sigma,
+            sigma_scale_bbox=dataset.density_sigma_scale_bbox,
+            sigma_from_seg_area=dataset.density_sigma_from_seg_area,
+            fixed_sigma_seg=dataset.density_fixed_sigma_seg,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(str(path), density.astype(np.float32))
+
+    return effective
