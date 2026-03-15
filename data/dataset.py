@@ -20,6 +20,11 @@ from .masking import generate_instance_mask
 # Sentinel: use per-image default location <image_path>/../density_maps/<stem>_density.npy
 DENSITY_MAP_DIR_AUTO = "auto"
 
+# Scale density from [0, 1] to [0, DENSITY_SCALE] so the network sees larger targets and
+# gets stronger gradients. Counts are recovered as density.sum() / DENSITY_SCALE.
+# Training must use this same constant when converting density sums to counts.
+DENSITY_SCALE = 255.0
+
 
 # Type aliases for annotations
 DotAnnotations = List[Tuple[float, float]]
@@ -94,8 +99,10 @@ class ObjectCountingDataset(Dataset):
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         keep_original_image: bool = False,
         density_map_dir: Optional[Union[str, Path]] = DENSITY_MAP_DIR_AUTO,
+        density_scale: float = DENSITY_SCALE,
     ):
         self.samples = samples
+        self.density_scale = density_scale
         self.root = Path(root) if root else None
         self.density_sigma = density_sigma
         self.density_sigma_scale_bbox = density_sigma_scale_bbox
@@ -167,6 +174,11 @@ class ObjectCountingDataset(Dataset):
             )
             density = torch.from_numpy(density.astype(np.float32)).unsqueeze(0)
 
+        # Scale density to [0, density_scale] so the network gets larger targets (stronger gradients).
+        # Count = sum(density) / density_scale.
+        density = density * self.density_scale
+        count = density.sum().item() / self.density_scale
+
         mask = generate_instance_mask(
             shape,
             ann_type,
@@ -184,7 +196,7 @@ class ObjectCountingDataset(Dataset):
             "density": density,
             "mask": mask,
             "annotation_type": ann_type,
-            "count": torch.tensor(len(annotations), dtype=torch.float32),
+            "count": torch.tensor(count, dtype=torch.float32),
         }
 
         if self.transform is not None:
