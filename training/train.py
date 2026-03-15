@@ -1,6 +1,8 @@
 """
 Minimal training script for density map regression (object counting)
 with logging and training curves.
+
+Density maps are in [0, DENSITY_SCALE] (e.g. 0-255); counts = density.sum() / DENSITY_SCALE.
 """
 
 import json
@@ -11,11 +13,32 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from data.dataset import DENSITY_SCALE
+
+
+# -----------------------------
+# Loss: density MSE + optional L1 count loss (reduces MAE on total count)
+# -----------------------------
+def compute_loss(pred_density, gt_density, count_loss_weight=1.0):
+    """
+    Combined loss for density map regression.
+    - MSE on density (both in [0, DENSITY_SCALE]): keeps spatial structure.
+    - L1 on counts: |pred_count - gt_count| with count = density.sum() / DENSITY_SCALE.
+    """
+    density_mse = F.mse_loss(pred_density, gt_density)
+
+    pred_count = pred_density.sum(dim=(1, 2, 3)) / DENSITY_SCALE
+    gt_count = gt_density.sum(dim=(1, 2, 3)) / DENSITY_SCALE
+    count_l1 = F.l1_loss(pred_count, gt_count)
+
+    loss = density_mse + count_loss_weight * count_l1
+    return loss
+
 
 # -----------------------------
 # Train for one epoch
 # -----------------------------
-def train_one_epoch(model, dataloader, optimizer, device):
+def train_one_epoch(model, dataloader, optimizer, device, count_loss_weight=1.0):
 
     model.train()
 
@@ -32,7 +55,7 @@ def train_one_epoch(model, dataloader, optimizer, device):
 
         pred_density = model(images)
 
-        loss = F.mse_loss(pred_density, gt_density)
+        loss = compute_loss(pred_density, gt_density, count_loss_weight=count_loss_weight)
 
         loss.backward()
         optimizer.step()
@@ -41,9 +64,9 @@ def train_one_epoch(model, dataloader, optimizer, device):
 
         total_loss += loss.item() * batch_size
 
-        # compute counts
-        pred_count = pred_density.sum(dim=(1, 2, 3))
-        gt_count = gt_density.sum(dim=(1, 2, 3))
+        # Counts from density (scale back to 0-1 range for count)
+        pred_count = pred_density.sum(dim=(1, 2, 3)) / DENSITY_SCALE
+        gt_count = gt_density.sum(dim=(1, 2, 3)) / DENSITY_SCALE
 
         mae = torch.abs(pred_count - gt_count).sum()
 
@@ -74,8 +97,8 @@ def validate(model, dataloader, device):
 
         pred_density = model(images)
 
-        pred_count = pred_density.sum(dim=(1,2,3))
-        gt_count = gt_density.sum(dim=(1,2,3))
+        pred_count = pred_density.sum(dim=(1, 2, 3)) / DENSITY_SCALE
+        gt_count = gt_density.sum(dim=(1, 2, 3)) / DENSITY_SCALE
 
         mae = torch.abs(pred_count - gt_count).sum()
 
@@ -111,7 +134,7 @@ def plot_training_curves(history):
 # ---------------------------------------------------------
 # Main training function
 # -----------------------------
-def train(model, train_dataset, val_dataset, epochs=100, batch_size=8):
+def train(model, train_dataset, val_dataset, epochs=100, batch_size=8, count_loss_weight=1.0):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -122,6 +145,8 @@ def train(model, train_dataset, val_dataset, epochs=100, batch_size=8):
         epochs,
         "| batch size:",
         batch_size,
+        "| count_loss_weight:",
+        count_loss_weight,
     )
 
     model = model.to(device)
@@ -162,7 +187,8 @@ def train(model, train_dataset, val_dataset, epochs=100, batch_size=8):
             model,
             train_loader,
             optimizer,
-            device
+            device,
+            count_loss_weight=count_loss_weight,
         )
 
         val_mae = validate(
