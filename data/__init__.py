@@ -12,6 +12,11 @@ from .shanghaitech import (
     load_shanghaitech_dataset,
     ShanghaiTechDataset,
 )
+from .fsc147 import (
+    build_fsc147_samples,
+    load_fsc147_dataset,
+    FSC147Dataset,
+)
 
 __all__ = [
     "AnnotationType",
@@ -21,4 +26,7 @@ __all__ = [
     "build_shanghaitech_samples",
     "load_shanghaitech_dataset",
     "ShanghaiTechDataset",
+    "build_fsc147_samples",
+    "load_fsc147_dataset",
+    "FSC147Dataset",
 ]

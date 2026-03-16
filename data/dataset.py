@@ -148,7 +148,6 @@ class ObjectCountingDataset(Dataset):
             if density_path.exists():
                 density = np.load(str(density_path)).astype(np.float32)
                 density = torch.from_numpy(density).unsqueeze(0)
-                print(f"Loaded density map from {density_path}")
             else:
                 density = generate_density(
                     shape,
