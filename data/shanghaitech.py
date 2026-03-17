@@ -66,7 +66,7 @@ def load_points_from_mat(mat_path: Path) -> List[Tuple[float, float]]:
 
 def build_shanghaitech_samples(
     root: Path | str,
-    part: str = "part_A_final",
+    part: Path | str | List[Path | str] = "part_A",
     split: str = "train_data",
 ) -> List[Dict[str, Any]]:
     """
@@ -79,31 +79,43 @@ def build_shanghaitech_samples(
 
     Returns:
         List[dict] with keys: image_path (relative to root), annotation_type, annotations.
+        If multiple parts are provided, samples from all parts are concatenated.
     """
     root = Path(root)
-    images_dir = root / part / split / "images"
-    gt_dir = root / part / split / "ground-truth"
 
-    if not images_dir.is_dir():
-        raise FileNotFoundError(f"Images directory not found: {images_dir}")
-    if not gt_dir.is_dir():
-        raise FileNotFoundError(f"Ground truth directory not found: {gt_dir}")
+    # Allow a single part (str/Path) or a list of parts.
+    if isinstance(part, (str, Path)):
+        parts: List[Path] = [Path(part)]
+    else:
+        parts = [Path(p) for p in part]
 
     samples: List[Dict[str, Any]] = []
-    for img_path in sorted(images_dir.glob("*.jpg")):
-        stem = img_path.stem  # e.g. 'IMG_1'
-        mat_path = gt_dir / f"GT_{stem}.mat"
-        if not mat_path.exists():
-            raise FileNotFoundError(f"Missing GT file for {img_path.name}: {mat_path}")
 
-        points = load_points_from_mat(mat_path)
-        samples.append(
-            {
-                "image_path": str(img_path.relative_to(root)),
-                "annotation_type": AnnotationType.DOT,
-                "annotations": points,
-            }
-        )
+    for part_dir in parts:
+        images_dir = root / part_dir / split / "images"
+        gt_dir = root / part_dir / split / "ground-truth"
+
+        if not images_dir.is_dir():
+            raise FileNotFoundError(f"Images directory not found: {images_dir}")
+        if not gt_dir.is_dir():
+            raise FileNotFoundError(f"Ground truth directory not found: {gt_dir}")
+
+        for img_path in sorted(images_dir.glob("*.jpg")):
+            stem = img_path.stem  # e.g. 'IMG_1'
+            mat_path = gt_dir / f"GT_{stem}.mat"
+            if not mat_path.exists():
+                raise FileNotFoundError(
+                    f"Missing GT file for {img_path.name}: {mat_path}"
+                )
+
+            points = load_points_from_mat(mat_path)
+            samples.append(
+                {
+                    "image_path": str(img_path.relative_to(root)),
+                    "annotation_type": AnnotationType.DOT,
+                    "annotations": points,
+                }
+            )
 
     return samples
 
@@ -121,7 +133,7 @@ class ShanghaiTechDataset(ObjectCountingDataset):
     def __init__(
         self,
         root: Path | str,
-        part: str = "part_A_final",
+        part: Path | str | List[Path | str] = "part_A_final",
         split: str = "train_data",
         *,
         density_sigma: float = 4.0,
@@ -143,7 +155,7 @@ class ShanghaiTechDataset(ObjectCountingDataset):
 
 def load_shanghaitech_dataset(
     root: Path | str,
-    part: str = "part_A_final",
+    part: Path | str | List[Path | str] = "part_A_final",
     split: str = "train_data",
     *,
     density_sigma: float = 4.0,

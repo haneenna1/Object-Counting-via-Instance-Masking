@@ -283,18 +283,34 @@ def visualize_image_and_density(
     model: optional torch.nn.Module. When provided, the model is evaluated on the image and its
            predicted density is shown alongside the ground-truth density.
     """
-    name_stem = Path(image_name).stem
-    sample = None
+    # image_name can be a stem, filename, or a relative path such as
+    # "part_A/train_data/images/IMG_1.jpg".
+    image_name_path = Path(image_name)
+    name_stem = image_name_path.stem
+
+    sample: Optional[Dict[str, Any]] = None
+
+    # 1) Prefer exact relative-path match against item["image_path"].
     for item in dataset.samples:
-        if Path(item["image_path"]).stem == name_stem:
+        item_path = Path(item["image_path"])
+        if image_name_path == item_path:
             sample = item
             break
+
+    # 2) Fallback: match by filename (or stem) if no exact path match was found.
     if sample is None:
-        stems = [Path(s["image_path"]).stem for s in dataset.samples]
-        hint = stems[:10] if len(stems) > 10 else stems
+        for item in dataset.samples:
+            item_path = Path(item["image_path"])
+            if image_name_path.name == item_path.name:
+                sample = item
+                break
+
+    if sample is None:
+        paths = [s["image_path"] for s in dataset.samples]
+        hint = paths[:10] if len(paths) > 10 else paths
         raise ValueError(
             f"No sample found for image name {image_name!r} (stem: {name_stem!r}). "
-            f"Available stems (sample): {hint}"
+            f"Try using a relative path like one of: {hint}"
         )
 
     image_path = sample["image_path"]
