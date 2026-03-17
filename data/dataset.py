@@ -271,6 +271,8 @@ def visualize_image_and_density(
     show_count: bool = True,
     use_precomputed_density: bool = False,
     model: Optional[torch.nn.Module] = None,
+    save_path: Optional[Union[str, Path]] = "visualization.png",
+    show: bool = False,
 ) -> None:
     """
     Load an image by name, compute (or load) its ground-truth density map, and visualize.
@@ -423,4 +425,13 @@ def visualize_image_and_density(
         plt.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.04)
 
     plt.tight_layout()
-    plt.show()
+
+    # Save to file when requested (useful on headless/SSH setups).
+    if save_path is not None:
+        plt.savefig(str(save_path), dpi=150)
+
+    # Optionally show the figure in environments with a GUI backend.
+    if show:
+        plt.show()
+
+    plt.close()

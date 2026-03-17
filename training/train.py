@@ -241,9 +241,12 @@ def train(
         history["train_mae"].append(train_mae)
         history["val_mae"].append(val_mae)
 
+        # Update training curves on disk after each epoch so they can be monitored mid-training.
+        plot_training_curves(history)
+
         print(
             f"Epoch {epoch:03d} | "
-            f"Loss {train_loss:.4f} | "
+            f"total loss {train_loss:.4f} | "
             f"Train MAE {train_mae:.2f} | "
             f"Val MAE {val_mae:.2f}"
         )
