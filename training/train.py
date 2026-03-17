@@ -170,6 +170,7 @@ def train(
     batch_size: int = 8,
     count_loss_weight: float = 1.0,
     loss_mode: str = "density_mse_count_l1",
+    early_stopping_patience: int | None = None,
 ):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -208,6 +209,7 @@ def train(
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
     best_mae = float("inf")
+    epochs_without_improvement = 0
 
     # training history
     history = {
@@ -256,6 +258,17 @@ def train(
             best_mae = val_mae
             torch.save(model.state_dict(), "best_model.pth")
             print("Saved best model")
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        # Early stopping check (based on validation MAE)
+        if early_stopping_patience is not None and epochs_without_improvement >= early_stopping_patience:
+            print(
+                f"Early stopping triggered after {epoch} epochs "
+                f"(no improvement in val MAE for {early_stopping_patience} epochs)."
+            )
+            break
 
     # -----------------------------------------------------
     # Save training history
