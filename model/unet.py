@@ -27,7 +27,7 @@ class UNetDensity(nn.Module):
     Two 3×3 convs + ReLU per block, no BatchNorm.
     """
 
-    def __init__(self, *, output_activation: str = "softplus"):
+    def __init__(self, *, output_activation: str = "none"):
         super().__init__()
         if output_activation not in ("relu", "softplus", "none"):
             raise ValueError("output_activation must be 'relu', 'softplus', or 'none'")

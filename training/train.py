@@ -17,28 +17,51 @@ from data.dataset import DENSITY_SCALE
 
 
 # -----------------------------
-# Loss: density MSE + optional L1 count loss (reduces MAE on total count)
+# Loss: density MSE + choice of count loss (MAE or MSE on count)
 # -----------------------------
-def compute_loss(pred_density, gt_density, count_loss_weight=1.0):
+def compute_loss(
+    pred_density,
+    gt_density,
+    count_loss_weight: float = 1.0,
+    loss_mode: str = "density_mse_count_l1",
+):
     """
     Combined loss for density map regression.
-    - MSE on density (both in [0, DENSITY_SCALE]): keeps spatial structure.
-    - L1 on counts: |pred_count - gt_count| with count = density.sum() / DENSITY_SCALE.
-    """
-    density_mse = F.mse_loss(pred_density, gt_density)
 
+    loss_mode:
+    - "density_mse_count_l1" (default):
+        MSE on density (keeps spatial structure) +
+        L1 (MAE) on counts: |pred_count - gt_count|
+    - "density_mse_count_mse":
+        MSE on density +
+        MSE on counts.
+    """
     pred_count = pred_density.sum(dim=(1, 2, 3)) / DENSITY_SCALE
     gt_count = gt_density.sum(dim=(1, 2, 3)) / DENSITY_SCALE
-    count_l1 = F.l1_loss(pred_count, gt_count)
 
-    loss = density_mse + count_loss_weight * count_l1
+    # Always use MSE on the density map
+    density_loss = F.mse_loss(pred_density, gt_density)
+
+    if loss_mode == "density_mse_count_mse":
+        count_loss = F.mse_loss(pred_count, gt_count)
+    else:  # "density_mse_count_l1"
+        count_loss = F.l1_loss(pred_count, gt_count)
+
+    loss = density_loss + count_loss_weight * count_loss
     return loss
 
 
 # -----------------------------
 # Train for one epoch
 # -----------------------------
-def train_one_epoch(model, dataloader, optimizer, device, count_loss_weight=1.0):
+def train_one_epoch(
+    model,
+    dataloader,
+    optimizer,
+    device,
+    count_loss_weight: float = 1.0,
+    loss_mode: str = "density_mse_count_l1",
+):
 
     model.train()
 
@@ -55,7 +78,12 @@ def train_one_epoch(model, dataloader, optimizer, device, count_loss_weight=1.0)
 
         pred_density = model(images)
 
-        loss = compute_loss(pred_density, gt_density, count_loss_weight=count_loss_weight)
+        loss = compute_loss(
+            pred_density,
+            gt_density,
+            count_loss_weight=count_loss_weight,
+            loss_mode=loss_mode,
+        )
 
         loss.backward()
         optimizer.step()
@@ -134,7 +162,15 @@ def plot_training_curves(history):
 # ---------------------------------------------------------
 # Main training function
 # -----------------------------
-def train(model, train_dataset, val_dataset, epochs=100, batch_size=8, count_loss_weight=1.0):
+def train(
+    model,
+    train_dataset,
+    val_dataset,
+    epochs: int = 100,
+    batch_size: int = 8,
+    count_loss_weight: float = 1.0,
+    loss_mode: str = "density_mse_count_l1",
+):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -145,6 +181,8 @@ def train(model, train_dataset, val_dataset, epochs=100, batch_size=8, count_los
         epochs,
         "| batch size:",
         batch_size,
+        "| loss_mode:",
+        loss_mode,
         "| count_loss_weight:",
         count_loss_weight,
     )
@@ -189,6 +227,7 @@ def train(model, train_dataset, val_dataset, epochs=100, batch_size=8, count_los
             optimizer,
             device,
             count_loss_weight=count_loss_weight,
+            loss_mode=loss_mode,
         )
 
         val_mae = validate(

@@ -159,6 +159,11 @@ def generate_density(
 
     """
     Generate ground-truth density map from annotations.
+
+    For dot annotations, sigma controls spread and peak:
+    - Smaller sigma → narrower blob (less spread), higher peak at the dot.
+    - Larger sigma → wider blob (more spread), lower peak.
+    Peak value at center = 1 / (2*pi*sigma^2); integral over plane = 1 per dot.
     """
 
     params = dict(

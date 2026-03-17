@@ -6,6 +6,7 @@ according to annotation type (dot, bbox, segmentation).
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import matplotlib.pyplot as plt
 import numpy as np
 
 import torch
@@ -214,6 +215,7 @@ class ObjectCountingDataset(Dataset):
 def precompute_density_maps(
     dataset: ObjectCountingDataset,
     density_map_dir: Optional[Union[str, Path]] = None,
+    force: bool = False,
 ) -> Union[Path, str]:
     """
     Pre-compute and save density maps for all samples so that __getitem__ can load them.
@@ -232,7 +234,7 @@ def precompute_density_maps(
 
     for item in dataset.samples:
         path = _density_map_path_for_sample(item, root, effective)
-        if path.exists():
+        if path.exists() and not force:
             continue
         image_path = item["image_path"]
         if root is not None:
@@ -255,5 +257,154 @@ def precompute_density_maps(
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         np.save(str(path), density.astype(np.float32))
+        print(f"Precomputed density map saved to {path}")
 
     return effective
+
+
+def visualize_image_and_density(
+    dataset: ObjectCountingDataset,
+    image_name: str,
+    *,
+    figsize: Tuple[float, float] = (12, 5),
+    density_cmap: str = "jet",
+    show_count: bool = True,
+    use_precomputed_density: bool = False,
+    model: Optional[torch.nn.Module] = None,
+) -> None:
+    """
+    Load an image by name, compute (or load) its ground-truth density map, and visualize.
+
+    image_name: filename or stem (e.g. "image.jpg" or "image") to match against sample image_path.
+    figsize: (width, height) for the figure.
+    density_cmap: colormap for the density map (e.g. "jet", "viridis", "hot").
+    show_count: if True, set title to include integral of density (object count).
+    use_precomputed_density: when True, load density from dataset.density_map_dir instead of recomputing.
+    model: optional torch.nn.Module. When provided, the model is evaluated on the image and its
+           predicted density is shown alongside the ground-truth density.
+    """
+    name_stem = Path(image_name).stem
+    sample = None
+    for item in dataset.samples:
+        if Path(item["image_path"]).stem == name_stem:
+            sample = item
+            break
+    if sample is None:
+        stems = [Path(s["image_path"]).stem for s in dataset.samples]
+        hint = stems[:10] if len(stems) > 10 else stems
+        raise ValueError(
+            f"No sample found for image name {image_name!r} (stem: {name_stem!r}). "
+            f"Available stems (sample): {hint}"
+        )
+
+    image_path = sample["image_path"]
+    if dataset.root is not None:
+        image_path = dataset.root / image_path
+    else:
+        image_path = Path(image_path)
+
+    image = _load_image(image_path)
+    _, H, W = image.shape
+    shape = (H, W)
+    ann_type = _parse_annotation_type(sample["annotation_type"])
+    annotations = sample["annotations"]
+
+    if use_precomputed_density:
+        if dataset.density_map_dir is None:
+            raise ValueError(
+                "use_precomputed_density=True but dataset.density_map_dir is None. "
+                "Either set density_map_dir when creating the dataset or disable use_precomputed_density."
+            )
+        density_path = _density_map_path_for_sample(
+            sample,
+            dataset.root,
+            dataset.density_map_dir,
+        )
+        if not density_path.exists():
+            raise FileNotFoundError(
+                f"Precomputed density map not found at {density_path}. "
+                "Run precompute_density_maps(...) first or set use_precomputed_density=False."
+            )
+        density = np.load(str(density_path)).astype(np.float32)
+    else:
+        density = generate_density(
+            shape,
+            ann_type,
+            annotations,
+            sigma=dataset.density_sigma,
+            sigma_scale_bbox=dataset.density_sigma_scale_bbox,
+            sigma_from_seg_area=dataset.density_sigma_from_seg_area,
+            fixed_sigma_seg=dataset.density_fixed_sigma_seg,
+        )
+
+    count = float(np.sum(density))
+
+    # Optional model prediction
+    pred_arr: Optional[np.ndarray] = None
+    pred_count: Optional[float] = None
+    if model is not None:
+        model.eval()
+        with torch.no_grad():
+            pred = model(image.unsqueeze(0))  # (1,1,H,W) or similar
+        if isinstance(pred, torch.Tensor):
+            pred = pred.detach().cpu()
+            if pred.ndim == 4 and pred.shape[0] == 1:
+                pred = pred.squeeze(0)
+            if pred.ndim == 3 and pred.shape[0] == 1:
+                pred = pred.squeeze(0)
+            pred_arr = pred.numpy()
+            pred_count = float(pred_arr.sum() / getattr(dataset, "density_scale", 1.0))
+
+    has_dots = ann_type == AnnotationType.DOT and annotations
+
+    # Layout:
+    # - GT only, no dots: 2 panels (Image, GT density)
+    # - Dots only: 3 panels (Image, Dots, GT density)
+    # - GT + pred, no dots: 3 panels (Image, GT density, Pred density)
+    # - Dots + pred: 4 panels (Image, Dots, GT density, Pred density)
+    if has_dots and pred_arr is not None:
+        fig, (ax_im, ax_dots, ax_den, ax_pred) = plt.subplots(
+            1, 4, figsize=(figsize[0] * 2.0, figsize[1])
+        )
+    elif has_dots:
+        fig, (ax_im, ax_dots, ax_den) = plt.subplots(
+            1, 3, figsize=(figsize[0] * 1.5, figsize[1])
+        )
+        ax_pred = None  # type: ignore[assignment]
+    elif pred_arr is not None:
+        fig, (ax_im, ax_den, ax_pred) = plt.subplots(
+            1, 3, figsize=(figsize[0] * 1.5, figsize[1])
+        )
+    else:
+        fig, (ax_im, ax_den) = plt.subplots(1, 2, figsize=figsize)
+        ax_dots = None  # type: ignore[assignment]
+        ax_pred = None  # type: ignore[assignment]
+
+    ax_im.imshow(image.permute(1, 2, 0).numpy())
+    ax_im.set_title("Image")
+    ax_im.axis("off")
+
+    if has_dots:
+        ax_dots.imshow(image.permute(1, 2, 0).numpy())
+        xs = [p[0] for p in annotations]
+        ys = [p[1] for p in annotations]
+        ax_dots.scatter(xs, ys, c="lime", s=12, edgecolors="darkgreen", linewidths=0.5, zorder=5)
+        ax_dots.set_title(f"Dots ({len(annotations)})")
+        ax_dots.axis("off")
+
+    im = ax_den.imshow(density, cmap=density_cmap)
+    ax_den.set_title(f"GT density" + (f" (count ≈ {count:.1f})" if show_count else ""))
+    ax_den.axis("off")
+    plt.colorbar(im, ax=ax_den, fraction=0.046, pad=0.04)
+
+    if pred_arr is not None and ax_pred is not None:
+        im_pred = ax_pred.imshow(pred_arr, cmap=density_cmap)
+        if show_count and pred_count is not None:
+            ax_pred.set_title(f"Pred density (count ≈ {pred_count:.1f})")
+        else:
+            ax_pred.set_title("Pred density")
+        ax_pred.axis("off")
+        plt.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    plt.show()
