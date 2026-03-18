@@ -87,6 +87,10 @@ class ObjectCountingDataset(Dataset):
         root: Optional[Union[str, Path]] = None,
         *,
         density_sigma: float = 4.0,
+        density_geometry_adaptive: bool = False,
+        density_beta: float = 0.3,
+        density_k: int = 3,
+        density_min_sigma: float = 1.0,
         density_sigma_scale_bbox: float = 0.25,
         density_sigma_from_seg_area: bool = True,
         density_fixed_sigma_seg: float = 4.0,
@@ -101,6 +105,10 @@ class ObjectCountingDataset(Dataset):
         self.samples = samples
         self.root = Path(root) if root else None
         self.density_sigma = density_sigma
+        self.density_geometry_adaptive = density_geometry_adaptive
+        self.density_beta = density_beta
+        self.density_k = density_k
+        self.density_min_sigma = density_min_sigma
         self.density_sigma_scale_bbox = density_sigma_scale_bbox
         self.density_sigma_from_seg_area = density_sigma_from_seg_area
         self.density_fixed_sigma_seg = density_fixed_sigma_seg
@@ -150,6 +158,10 @@ class ObjectCountingDataset(Dataset):
                     ann_type,
                     annotations,
                     sigma=self.density_sigma,
+                    geometry_adaptive=self.density_geometry_adaptive,
+                    beta=self.density_beta,
+                    k=self.density_k,
+                    min_sigma=self.density_min_sigma,
                     sigma_scale_bbox=self.density_sigma_scale_bbox,
                     sigma_from_seg_area=self.density_sigma_from_seg_area,
                     fixed_sigma_seg=self.density_fixed_sigma_seg,
@@ -163,6 +175,10 @@ class ObjectCountingDataset(Dataset):
                 ann_type,
                 annotations,
                 sigma=self.density_sigma,
+                geometry_adaptive=self.density_geometry_adaptive,
+                beta=self.density_beta,
+                k=self.density_k,
+                min_sigma=self.density_min_sigma,
                 sigma_scale_bbox=self.density_sigma_scale_bbox,
                 sigma_from_seg_area=self.density_sigma_from_seg_area,
                 fixed_sigma_seg=self.density_fixed_sigma_seg,
@@ -209,6 +225,11 @@ def precompute_density_maps(
     dataset: ObjectCountingDataset,
     density_map_dir: Optional[Union[str, Path]] = None,
     force: bool = False,
+    *,
+    density_geometry_adaptive: Optional[bool] = None,
+    density_beta: Optional[float] = None,
+    density_k: Optional[int] = None,
+    density_min_sigma: Optional[float] = None,
 ) -> Union[Path, str]:
     """
     Pre-compute and save density maps for all samples so that __getitem__ can load them.
@@ -216,6 +237,9 @@ def precompute_density_maps(
     When density_map_dir is not passed, uses the dataset's density_map_dir (e.g. DENSITY_MAP_DIR_AUTO
     for per-image default: <image_path>/../density_maps/<stem>_density.npy).
     Returns the effective directory or DENSITY_MAP_DIR_AUTO when using per-image paths.
+
+    If any of density_* arguments are provided (not None), they override the dataset's
+    corresponding density generation settings for this precompute call.
     """
     effective = (
         Path(density_map_dir) if density_map_dir is not None and density_map_dir != DENSITY_MAP_DIR_AUTO
@@ -224,6 +248,16 @@ def precompute_density_maps(
     root = dataset.root
     if effective != DENSITY_MAP_DIR_AUTO:
         effective.mkdir(parents=True, exist_ok=True)
+
+    # Allow one-off overrides for adaptive kernels during precompute.
+    geometry_adaptive = (
+        dataset.density_geometry_adaptive
+        if density_geometry_adaptive is None
+        else density_geometry_adaptive
+    )
+    beta = dataset.density_beta if density_beta is None else density_beta
+    k = dataset.density_k if density_k is None else density_k
+    min_sigma = dataset.density_min_sigma if density_min_sigma is None else density_min_sigma
 
     for item in dataset.samples:
         path = _density_map_path_for_sample(item, root, effective)
@@ -244,6 +278,10 @@ def precompute_density_maps(
             ann_type,
             annotations,
             sigma=dataset.density_sigma,
+            geometry_adaptive=geometry_adaptive,
+            beta=beta,
+            k=k,
+            min_sigma=min_sigma,
             sigma_scale_bbox=dataset.density_sigma_scale_bbox,
             sigma_from_seg_area=dataset.density_sigma_from_seg_area,
             fixed_sigma_seg=dataset.density_fixed_sigma_seg,
@@ -267,6 +305,7 @@ def visualize_image_and_density(
     pred_density_scale: float = 1.0,
     save_path: Optional[Union[str, Path]] = "visualization.png",
     show: bool = False,
+    device: Optional[torch.device] = 'cuda'
 ) -> None:
     """
     Load an image by name, compute (or load) its ground-truth density map, and visualize.
@@ -286,6 +325,8 @@ def visualize_image_and_density(
     name_stem = image_name_path.stem
 
     sample: Optional[Dict[str, Any]] = None
+
+    print(f"visualization: image name={image_name_path} precomputed density={use_precomputed_density} adaptive={dataset.density_geometry_adaptive} beta={dataset.density_beta} k={dataset.density_k} min_sigma={dataset.density_min_sigma}")
 
     # 1) Prefer exact relative-path match against item["image_path"].
     for item in dataset.samples:
@@ -345,6 +386,10 @@ def visualize_image_and_density(
             ann_type,
             annotations,
             sigma=dataset.density_sigma,
+            geometry_adaptive=dataset.density_geometry_adaptive,
+            beta=dataset.density_beta,
+            k=dataset.density_k,
+            min_sigma=dataset.density_min_sigma,
             sigma_scale_bbox=dataset.density_sigma_scale_bbox,
             sigma_from_seg_area=dataset.density_sigma_from_seg_area,
             fixed_sigma_seg=dataset.density_fixed_sigma_seg,
@@ -357,6 +402,8 @@ def visualize_image_and_density(
     pred_count: Optional[float] = None
     if model is not None:
         model.eval()
+        model = model.to(device)
+        image = image.to(device)
         with torch.no_grad():
             pred = model(image.unsqueeze(0))  # (1,1,H,W) or similar
         if isinstance(pred, torch.Tensor):
@@ -393,12 +440,12 @@ def visualize_image_and_density(
         ax_dots = None  # type: ignore[assignment]
         ax_pred = None  # type: ignore[assignment]
 
-    ax_im.imshow(image.permute(1, 2, 0).numpy())
+    ax_im.imshow(image.permute(1, 2, 0).to('cpu').numpy())
     ax_im.set_title("Image")
     ax_im.axis("off")
 
     if has_dots:
-        ax_dots.imshow(image.permute(1, 2, 0).numpy())
+        ax_dots.imshow(image.permute(1, 2, 0).to('cpu').numpy())
         xs = [p[0] for p in annotations]
         ys = [p[1] for p in annotations]
         ax_dots.scatter(xs, ys, c="lime", s=12, edgecolors="darkgreen", linewidths=0.5, zorder=5)
@@ -406,7 +453,7 @@ def visualize_image_and_density(
         ax_dots.axis("off")
 
     im = ax_den.imshow(density, cmap=density_cmap)
-    ax_den.set_title(f"GT density" + (f" (count ≈ {count:.1f})" if show_count else ""))
+    ax_den.set_title(f"GT density" + (f" (count ≈ {count:.1f}) adaptive={dataset.density_geometry_adaptive} beta={dataset.density_beta} k={dataset.density_k} min_sigma={dataset.density_min_sigma}"  if show_count else ""))
     ax_den.axis("off")
     plt.colorbar(im, ax=ax_den, fraction=0.046, pad=0.04)
 

@@ -5,6 +5,7 @@ Uses normalized 2D Gaussians so that the integral over the image approximates th
 
 import numpy as np
 from typing import List, Tuple, Union
+from scipy.spatial import KDTree
 
 from .annotation_types import AnnotationType
 
@@ -13,51 +14,107 @@ from .annotation_types import AnnotationType
 # GAUSSIAN UTILITY
 # ---------------------------------------------------------
 
-def _gaussian_2d(
-    shape: Tuple[int, int],
-    center: Tuple[float, float],
-    sigma: Union[float, Tuple[float, float]],
-    normalize: bool = True,
+def gaussian_2d_patch(
+    sigma: float,
+    truncate: float = 3.0,
 ) -> np.ndarray:
+    """
+    Create a normalized 2D Gaussian patch centered at (0,0),
+    truncated at `truncate * sigma`.
+    """
+    radius = int(truncate * sigma)
+    size = 2 * radius + 1
 
-    H, W = shape
-
-    if isinstance(sigma, (int, float)):
-        sigma_y = sigma_x = float(sigma)
-    else:
-        sigma_y, sigma_x = sigma
-
-    cy, cx = center
-
-    y = np.arange(H, dtype=np.float64) - cy
-    x = np.arange(W, dtype=np.float64) - cx
-
+    y = np.arange(-radius, radius + 1, dtype=np.float64)
+    x = np.arange(-radius, radius + 1, dtype=np.float64)
     yy, xx = np.meshgrid(y, x, indexing="ij")
 
-    g = np.exp(-(yy ** 2 / (2 * sigma_y ** 2) + xx ** 2 / (2 * sigma_x ** 2)))
+    g = np.exp(-(yy**2 + xx**2) / (2 * sigma**2))
 
-    if normalize:
-        g = g / (2 * np.pi * sigma_y * sigma_x)
+    # ✅ Discrete normalization (critical)
+    g /= g.sum()
 
     return g
+
 
 
 # ---------------------------------------------------------
 # DOT HANDLER
 # ---------------------------------------------------------
 
-def _density_from_points(shape, points, params):
+def _density_from_points(
+    shape: Tuple[int, int],
+    points: List[Tuple[float, float]],  # (x, y)
+    sigma: float = 4.0,
+    geometry_adaptive: bool = True,
+    k: int = 3,
+    beta: float = 0.3,
+    min_sigma: float = 1.0,
+    max_sigma: float = 15.0,
+) -> np.ndarray:
+    """
+    Generate density map using geometry-adaptive kernels (CSRNet/MCNN style).
 
-    sigma = params["sigma"]
+    Args:
+        shape: (H, W)
+        points: list of (x, y)
+    """
 
     H, W = shape
     density = np.zeros((H, W), dtype=np.float64)
 
-    for (x, y) in points:
-        density += _gaussian_2d(shape, (y, x), sigma, normalize=True)
+    if len(points) == 0:
+        return density
+
+    pts = np.asarray(points, dtype=np.float64)
+
+    # -----------------------------------------------------
+    # Compute adaptive sigmas (kNN)
+    # -----------------------------------------------------
+    if geometry_adaptive and len(points) > k:
+        tree = KDTree(pts)
+
+        # k+1 because first neighbor is the point itself
+        dists, _ = tree.query(pts, k=k + 1)
+        dists = dists[:, 1:]  # remove self-distance
+
+        mean_dists = dists.mean(axis=1)
+
+        sigmas = beta * mean_dists
+        sigmas = np.clip(sigmas, min_sigma, max_sigma)
+
+    else:
+        sigmas = np.full(len(points), sigma, dtype=np.float64)
+
+    # -----------------------------------------------------
+    # Place Gaussians (local patches)
+    # -----------------------------------------------------
+    for (x, y), s in zip(pts, sigmas):
+        x_int = int(round(x))
+        y_int = int(round(y))
+
+        # Skip invalid points
+        if x_int < 0 or x_int >= W or y_int < 0 or y_int >= H:
+            continue
+
+        g = gaussian_2d_patch(s)
+        radius = g.shape[0] // 2
+
+        # Bounding box in image
+        y1 = max(0, y_int - radius)
+        y2 = min(H, y_int + radius + 1)
+        x1 = max(0, x_int - radius)
+        x2 = min(W, x_int + radius + 1)
+
+        # Corresponding region in Gaussian
+        gy1 = y1 - (y_int - radius)
+        gy2 = gy1 + (y2 - y1)
+        gx1 = x1 - (x_int - radius)
+        gx2 = gx1 + (x2 - x1)
+
+        density[y1:y2, x1:x2] += g[gy1:gy2, gx1:gx2]
 
     return density
-
 
 # ---------------------------------------------------------
 # BBOX HANDLER
@@ -81,7 +138,7 @@ def _density_from_bboxes(shape, bboxes, params):
         sigma = sigma_scale * (w + h) / 2.0
         sigma = max(sigma, 1.0)
 
-        density += _gaussian_2d(shape, (cy, cx), sigma, normalize=True)
+        density += gaussian_2d_patch(sigma)
 
     return density
 
@@ -122,7 +179,7 @@ def _density_from_segmentations(shape, masks, params):
         else:
             sigma = fixed_sigma
 
-        density += _gaussian_2d(shape, (cy, cx), sigma, normalize=True)
+        density += gaussian_2d_patch(sigma)
 
     return density
 
@@ -155,6 +212,10 @@ def generate_density(
     sigma_scale_bbox: float = 0.25,
     sigma_from_seg_area: bool = True,
     fixed_sigma_seg: float = 4.0,
+    geometry_adaptive: bool = False,
+    beta: float = 0.3,
+    k: int = 3,
+    min_sigma: float = 1.0,
 ) -> np.ndarray:
 
     """
@@ -164,6 +225,12 @@ def generate_density(
     - Smaller sigma → narrower blob (less spread), higher peak at the dot.
     - Larger sigma → wider blob (more spread), lower peak.
     Peak value at center = 1 / (2*pi*sigma^2); integral over plane = 1 per dot.
+
+    geometry_adaptive:
+      CSRNet-style geometry-adaptive kernels (Li et al., CVPR 2018, following [18]):
+        sigma_i = beta * d_i
+      where d_i is the mean distance to the k nearest neighbors of point i.
+      For sparse crowds (len(points) <= k), this falls back to fixed sigma.
     """
 
     params = dict(
@@ -171,6 +238,10 @@ def generate_density(
         sigma_scale_bbox=sigma_scale_bbox,
         sigma_from_seg_area=sigma_from_seg_area,
         fixed_sigma_seg=fixed_sigma_seg,
+        geometry_adaptive=geometry_adaptive,
+        beta=beta,
+        k=k,
+        min_sigma=min_sigma,
     )
 
     try:

@@ -193,18 +193,9 @@ def train(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(
-        "Training on",
+        f"Training {model_name} model on {data_name} dataset on",
         device,
-        "| epochs:",
-        epochs,
-        "| batch size:",
-        batch_size,
-        "| loss_mode:",
-        loss_mode,
-        "| count_loss_weight:",
-        count_loss_weight,
-        "| density_scale:",
-        density_scale,
+        f"with {epochs} epochs: , batch size: {batch_size}, loss mode: {loss_mode}, count loss weight: {count_loss_weight}, density scale: {density_scale}"
     )
 
     model = model.to(device)
@@ -271,6 +262,8 @@ def train(
             f"Epoch {epoch:03d} | "
             f"total loss {train_loss:.4f} | "
             f"Train MAE {train_mae:.2f} | "
+            f"weighted train mae {train_mae * count_loss_weight:.4f} | "
+            f"train density mse {train_loss - train_mae * count_loss_weight:.4f} | "
             f"Val MAE {val_mae:.2f}"
         )
 
