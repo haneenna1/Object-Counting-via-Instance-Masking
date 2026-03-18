@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torchvision.models import vgg16, VGG16_Weights
 
 class _ConvRelu(nn.Sequential):
     def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, p: int = 1, d: int = 1):
@@ -10,6 +11,35 @@ class _ConvRelu(nn.Sequential):
             nn.ReLU(inplace=True),
         )
 
+
+def load_vgg16_frontend(csrnet, freeze_frontend: bool = False):
+    vgg = vgg16(weights=VGG16_Weights.DEFAULT).features
+    mapping = [
+        (0,  csrnet.conv1_1[0]),
+        (2,  csrnet.conv1_2[0]),
+        (5,  csrnet.conv2_1[0]),
+        (7,  csrnet.conv2_2[0]),
+        (10, csrnet.conv3_1[0]),
+        (12, csrnet.conv3_2[0]),
+        (14, csrnet.conv3_3[0]),
+        (17, csrnet.conv4_1[0]),
+        (19, csrnet.conv4_2[0]),
+        (21, csrnet.conv4_3[0]),
+    ]
+    for vgg_idx, csr_conv in mapping:
+        vgg_conv = vgg[vgg_idx]
+        assert isinstance(vgg_conv, torch.nn.Conv2d)
+        assert isinstance(csr_conv, torch.nn.Conv2d)
+        csr_conv.weight.data.copy_(vgg_conv.weight.data)
+        csr_conv.bias.data.copy_(vgg_conv.bias.data)
+    if freeze_frontend:
+        for p in [
+            *csrnet.conv1_1.parameters(), *csrnet.conv1_2.parameters(),
+            *csrnet.conv2_1.parameters(), *csrnet.conv2_2.parameters(),
+            *csrnet.conv3_1.parameters(), *csrnet.conv3_2.parameters(), *csrnet.conv3_3.parameters(),
+            *csrnet.conv4_1.parameters(), *csrnet.conv4_2.parameters(), *csrnet.conv4_3.parameters(),
+        ]:
+            p.requires_grad = False
 
 class CSRNet(nn.Module):
     """

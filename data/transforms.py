@@ -43,7 +43,7 @@ def resize_transform(sample, size=(512, 512)):
     return sample
 
 
-def random_crop_transform(sample, crop_size=(512, 512)):
+def random_crop_transform(sample, crop_size=(256, 256)):
     image = sample["image"]
     density = sample["density"]
     mask = sample["mask"]
@@ -74,15 +74,6 @@ def random_crop_transform(sample, crop_size=(512, 512)):
     image = image[:, top : top + crop_h, left : left + crop_w]
     density = density[:, top : top + crop_h, left : left + crop_w]
     mask = mask[:, top : top + crop_h, left : left + crop_w]
-
-    if (
-        image.shape != (3, 512, 512)
-        or mask.shape != (1, 512, 512)
-        or density.shape != (1, 512, 512)
-    ):
-        print("before image shape:", b_im_sh, "after image shape:", image.shape)
-        print("before density shape:", b_d_sh, "after density shape:", density.shape)
-        print("before mask shape:", b_msk_sh, "after mask shape:", mask.shape)
 
     sample["image"] = image
     sample["density"] = density
@@ -154,4 +145,22 @@ def compose_transforms(*transforms):
         return sample
 
     return _transform
+
+
+def normalize_imagenet_transform(
+    sample,
+    mean=(0.485, 0.456, 0.406),
+    std=(0.229, 0.224, 0.225),
+):
+    """
+    Apply ImageNet mean/std normalization to sample["image"] only.
+    Density maps and masks are left untouched.
+
+    Assumes sample["image"] is a float tensor in [0, 1] with shape (3, H, W).
+    """
+    img = sample["image"]
+    mean_t = torch.tensor(mean, dtype=img.dtype, device=img.device).view(3, 1, 1)
+    std_t = torch.tensor(std, dtype=img.dtype, device=img.device).view(3, 1, 1)
+    sample["image"] = (img - mean_t) / std_t
+    return sample
 
