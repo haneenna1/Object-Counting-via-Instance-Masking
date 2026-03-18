@@ -13,7 +13,6 @@ import kagglehub
 from data import density
 from data.dataset import (
     DENSITY_MAP_DIR_AUTO,
-    DENSITY_SCALE,
     precompute_density_maps,
     visualize_image_and_density,
 )
@@ -29,15 +28,15 @@ from data.transforms import (
 )
 from model.unet import UNetDensity
 from model.csrnet import CSRNet
-from training.train import train
+from training.train import train, DEFAULT_DENSITY_SCALE
 
-def visualize_sample(sample, model=None):
+def visualize_sample(sample, model=None, density_scale: float = DEFAULT_DENSITY_SCALE):
 
     image = sample["image"].cpu().numpy().transpose(1, 2, 0)
     original_image = sample["original_image"].cpu().numpy().transpose(1, 2, 0)
     density = sample["density"].cpu().numpy().squeeze()
     mask = sample["mask"].cpu().numpy().squeeze()
-    gt_count = sample["count"].item()  # count = density.sum() / DENSITY_SCALE
+    gt_count = sample["count"].item()  # ≈ density.sum() (raw GT)
 
     fig, axs = plt.subplots(1, 5, figsize=(18, 5))
 
@@ -46,9 +45,8 @@ def visualize_sample(sample, model=None):
     axs[0].set_title(f"original Image. GT count={gt_count:.2f}")
     axs[0].axis("off")
 
-    # density (values in [0, DENSITY_SCALE]; count = sum / DENSITY_SCALE)
     axs[1].imshow(density, cmap="jet")
-    axs[1].set_title(f"Density (0-255)\ncount={density.sum() / DENSITY_SCALE:.2f}")
+    axs[1].set_title(f"GT density\ncount≈{density.sum():.2f}")
     axs[1].axis("off")
 
     # mask
@@ -65,7 +63,7 @@ def visualize_sample(sample, model=None):
     if model:
         model.eval()
         pred_density = model(sample["image"].unsqueeze(0))
-        pred_count = pred_density.sum().item() / DENSITY_SCALE
+        pred_count = pred_density.sum().item() / density_scale
         axs[4].imshow(pred_density.detach().numpy().squeeze(), cmap="jet")
         axs[4].set_title(f"Pred density\ncount={pred_count:.2f}")
         axs[4].axis("off")
@@ -94,6 +92,37 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.01,
         help="Weight for the count loss term.",
+    )
+    parser.add_argument(
+        "--data-name",
+        type=str,
+        default="shng",
+        help="Short identifier for the dataset (used in saved filenames).",
+    )
+    parser.add_argument(
+        "--mask-ratio",
+        type=float,
+        default=None,
+        help="Masking ratio used during training (used in saved filenames).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="trained_models",
+        help="Directory where trained models and curves are saved.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=None,
+        help="Number of epochs without improvement to wait before stopping training.",
+    )
+    parser.add_argument(
+        "--density-scale",
+        type=float,
+        default=DEFAULT_DENSITY_SCALE,
+        help="Training only: MSE target = raw_gt * scale; count from pred = pred.sum()/scale. "
+        "Must match when visualizing trained checkpoints.",
     )
     return parser.parse_args()
 
@@ -170,12 +199,20 @@ if __name__ == "__main__":
         val_dataset,
         epochs=args.epochs,
         count_loss_weight=args.count_loss_weight,
+        model_name=args.model,
+        data_name=args.data_name,
+        mask_ratio=args.mask_ratio,
+        output_dir=args.output_dir,
+        early_stopping_patience=args.early_stopping_patience,
+        density_scale=args.density_scale,
+        batch_size=8,
     )
 
-    model.load_state_dict(torch.load("best_model.pth"))
+    # model.load_state_dict(torch.load("best_model.pth"))
     visualize_image_and_density(
         dataset,
-        "part_B/train_data/images/IMG_1.jpg",
+        "part_A/train_data/images/IMG_199.jpg",
         use_precomputed_density=True,
-        model=model,
+        pred_density_scale=args.density_scale,
+        # model=model,
     )

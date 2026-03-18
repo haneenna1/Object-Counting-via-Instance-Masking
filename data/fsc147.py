@@ -40,7 +40,7 @@ from torchvision.io import read_image
 import matplotlib.pyplot as plt
 
 from data.annotation_types import AnnotationType
-from data.dataset import ObjectCountingDataset, DENSITY_SCALE
+from data.dataset import ObjectCountingDataset
 
 
 def _load_fsc147_annotation_index(

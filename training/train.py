@@ -2,18 +2,22 @@
 Minimal training script for density map regression (object counting)
 with logging and training curves.
 
-Density maps are in [0, DENSITY_SCALE] (e.g. 0-255); counts = density.sum() / DENSITY_SCALE.
+Dataset yields raw density (sum ≈ count). Training uses density_scale only here:
+  - MSE target = raw_gt * density_scale (stronger gradients)
+  - pred_count = pred.sum() / density_scale, gt_count = raw_gt.sum()
 """
 
 import json
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data.dataset import DENSITY_SCALE
+# Default training scale (only applied in this module, not in dataset).
+DEFAULT_DENSITY_SCALE = 255.0
 
 
 # -----------------------------
@@ -24,31 +28,38 @@ def compute_loss(
     gt_density,
     count_loss_weight: float = 1.0,
     loss_mode: str = "density_mse_count_l1",
+    density_scale: float = DEFAULT_DENSITY_SCALE,
 ):
     """
-    Combined loss for density map regression.
-
-    loss_mode:
-    - "density_mse_count_l1" (default):
-        MSE on density (keeps spatial structure) +
-        L1 (MAE) on counts: |pred_count - gt_count|
-    - "density_mse_count_mse":
-        MSE on density +
-        MSE on counts.
+    gt_density: raw from dataloader (integral ≈ count).
+    Network is trained to match gt_density * density_scale.
     """
-    pred_count = pred_density.sum(dim=(1, 2, 3)) / DENSITY_SCALE
-    gt_count = gt_density.sum(dim=(1, 2, 3)) / DENSITY_SCALE
+    # CSRNet-style: downsample raw GT, preserve integral
+    if pred_density.shape[-2:] != gt_density.shape[-2:]:
+        H_gt, W_gt = gt_density.shape[-2:]
+        H_pred, W_pred = pred_density.shape[-2:]
+        gt_density = F.interpolate(
+            gt_density,
+            size=(H_pred, W_pred),
+            mode="bilinear",
+            align_corners=False,
+        )
+        scale_h = H_gt / H_pred
+        scale_w = W_gt / W_pred
+        gt_density = gt_density * (scale_h * scale_w)
 
-    # Always use MSE on the density map
-    density_loss = F.mse_loss(pred_density, gt_density)
+    gt_target = gt_density * density_scale
+    density_loss = F.mse_loss(pred_density, gt_target)
+
+    pred_count = pred_density.sum(dim=(1, 2, 3)) / density_scale
+    gt_count = gt_density.sum(dim=(1, 2, 3))
 
     if loss_mode == "density_mse_count_mse":
         count_loss = F.mse_loss(pred_count, gt_count)
-    else:  # "density_mse_count_l1"
+    else:
         count_loss = F.l1_loss(pred_count, gt_count)
 
-    loss = density_loss + count_loss_weight * count_loss
-    return loss
+    return density_loss + count_loss_weight * count_loss
 
 
 # -----------------------------
@@ -61,6 +72,7 @@ def train_one_epoch(
     device,
     count_loss_weight: float = 1.0,
     loss_mode: str = "density_mse_count_l1",
+    density_scale: float = DEFAULT_DENSITY_SCALE,
 ):
 
     model.train()
@@ -83,6 +95,7 @@ def train_one_epoch(
             gt_density,
             count_loss_weight=count_loss_weight,
             loss_mode=loss_mode,
+            density_scale=density_scale,
         )
 
         loss.backward()
@@ -92,9 +105,8 @@ def train_one_epoch(
 
         total_loss += loss.item() * batch_size
 
-        # Counts from density (scale back to 0-1 range for count)
-        pred_count = pred_density.sum(dim=(1, 2, 3)) / DENSITY_SCALE
-        gt_count = gt_density.sum(dim=(1, 2, 3)) / DENSITY_SCALE
+        pred_count = pred_density.sum(dim=(1, 2, 3)) / density_scale
+        gt_count = gt_density.sum(dim=(1, 2, 3))
 
         mae = torch.abs(pred_count - gt_count).sum()
 
@@ -111,7 +123,7 @@ def train_one_epoch(
 # Validation
 # -----------------------------
 @torch.no_grad()
-def validate(model, dataloader, device):
+def validate(model, dataloader, device, density_scale: float = DEFAULT_DENSITY_SCALE):
 
     model.eval()
 
@@ -125,8 +137,8 @@ def validate(model, dataloader, device):
 
         pred_density = model(images)
 
-        pred_count = pred_density.sum(dim=(1, 2, 3)) / DENSITY_SCALE
-        gt_count = gt_density.sum(dim=(1, 2, 3)) / DENSITY_SCALE
+        pred_count = pred_density.sum(dim=(1, 2, 3)) / density_scale
+        gt_count = gt_density.sum(dim=(1, 2, 3))
 
         mae = torch.abs(pred_count - gt_count).sum()
 
@@ -139,7 +151,7 @@ def validate(model, dataloader, device):
 # ---------------------------------------------------------
 # Plot training curves
 # ---------------------------------------------------------
-def plot_training_curves(history):
+def plot_training_curves(history, save_path: str | Path):
 
     epochs = range(1, len(history["train_loss"]) + 1)
 
@@ -155,7 +167,7 @@ def plot_training_curves(history):
     plt.legend()
 
     plt.tight_layout()
-    plt.savefig("training_curves.png")
+    plt.savefig(str(save_path))
     plt.close()
 
 
@@ -170,7 +182,12 @@ def train(
     batch_size: int = 8,
     count_loss_weight: float = 1.0,
     loss_mode: str = "density_mse_count_l1",
-    early_stopping_patience: int | None = None,
+    early_stopping_patience: int | None = 15,
+    model_name: str = "model",
+    data_name: str = "data",
+    mask_ratio: float | None = None,
+    output_dir: str | Path = "trained_models",
+    density_scale: float = DEFAULT_DENSITY_SCALE,
 ):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -186,6 +203,8 @@ def train(
         loss_mode,
         "| count_loss_weight:",
         count_loss_weight,
+        "| density_scale:",
+        density_scale,
     )
 
     model = model.to(device)
@@ -195,7 +214,7 @@ def train(
         batch_size=batch_size,
         shuffle=True,
         num_workers=8,
-        pin_memory=True
+        pin_memory=True,
     )
 
     val_loader = DataLoader(
@@ -203,24 +222,26 @@ def train(
         batch_size=batch_size,
         shuffle=False,
         num_workers=8,
-        pin_memory=True
+        pin_memory=True,
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    mask_str = "nomsk" if mask_ratio is None else str(mask_ratio)
+    run_name = f"{model_name}-{data_name}-{mask_str}"
+
     best_mae = float("inf")
     epochs_without_improvement = 0
 
-    # training history
     history = {
         "train_loss": [],
         "train_mae": [],
         "val_mae": [],
     }
 
-    # -----------------------------------------------------
-    # Epoch loop
-    # -----------------------------------------------------
     for epoch in range(1, epochs + 1):
 
         train_loss, train_mae = train_one_epoch(
@@ -230,21 +251,21 @@ def train(
             device,
             count_loss_weight=count_loss_weight,
             loss_mode=loss_mode,
+            density_scale=density_scale,
         )
 
         val_mae = validate(
             model,
             val_loader,
-            device
+            device,
+            density_scale=density_scale,
         )
 
-        # store metrics
         history["train_loss"].append(train_loss)
         history["train_mae"].append(train_mae)
         history["val_mae"].append(val_mae)
 
-        # Update training curves on disk after each epoch so they can be monitored mid-training.
-        plot_training_curves(history)
+        plot_training_curves(history, output_dir / f"{run_name}-curves.png")
 
         print(
             f"Epoch {epoch:03d} | "
@@ -253,16 +274,15 @@ def train(
             f"Val MAE {val_mae:.2f}"
         )
 
-        # save best model
         if val_mae < best_mae:
             best_mae = val_mae
-            torch.save(model.state_dict(), "best_model.pth")
-            print("Saved best model")
+            model_path = output_dir / f"{run_name}.pth"
+            torch.save(model.state_dict(), model_path)
+            print(f"Saved best model to {model_path}")
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
 
-        # Early stopping check (based on validation MAE)
         if early_stopping_patience is not None and epochs_without_improvement >= early_stopping_patience:
             print(
                 f"Early stopping triggered after {epoch} epochs "
@@ -270,17 +290,13 @@ def train(
             )
             break
 
-    # -----------------------------------------------------
-    # Save training history
-    # -----------------------------------------------------
-    with open("training_history.json", "w") as f:
+    history_path = output_dir / f"{run_name}-history.json"
+    with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
 
-    # -----------------------------------------------------
-    # Plot curves
-    # -----------------------------------------------------
-    plot_training_curves(history)
+    curves_path = output_dir / f"{run_name}-curves.png"
+    plot_training_curves(history, curves_path)
 
     print("Training finished")
-    print("History saved to training_history.json")
-    print("Curves saved to training_curves.png")
+    print(f"History saved to {history_path}")
+    print(f"Curves saved to {curves_path}")

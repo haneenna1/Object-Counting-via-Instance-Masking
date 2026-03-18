@@ -21,11 +21,8 @@ from .masking import generate_instance_mask
 # Sentinel: use per-image default location <image_path>/../density_maps/<stem>_density.npy
 DENSITY_MAP_DIR_AUTO = "auto"
 
-# Scale density from [0, 1] to [0, DENSITY_SCALE] so the network sees larger targets and
-# gets stronger gradients. Counts are recovered as density.sum() / DENSITY_SCALE.
-# Training must use this same constant when converting density sums to counts.
-DENSITY_SCALE = 255.0
-
+# Ground-truth density maps are unscaled here: integral ≈ object count.
+# Apply training-time scaling only in training/train.py (density_scale) for targets and pred→count.
 
 # Type aliases for annotations
 DotAnnotations = List[Tuple[float, float]]
@@ -100,10 +97,8 @@ class ObjectCountingDataset(Dataset):
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         keep_original_image: bool = False,
         density_map_dir: Optional[Union[str, Path]] = DENSITY_MAP_DIR_AUTO,
-        density_scale: float = DENSITY_SCALE,
     ):
         self.samples = samples
-        self.density_scale = density_scale
         self.root = Path(root) if root else None
         self.density_sigma = density_sigma
         self.density_sigma_scale_bbox = density_sigma_scale_bbox
@@ -174,10 +169,8 @@ class ObjectCountingDataset(Dataset):
             )
             density = torch.from_numpy(density.astype(np.float32)).unsqueeze(0)
 
-        # Scale density to [0, density_scale] so the network gets larger targets (stronger gradients).
-        # Count = sum(density) / density_scale.
-        density = density * self.density_scale
-        count = density.sum().item() / self.density_scale
+        # Raw density: sum ≈ object count (see data/density.py Gaussians).
+        count = float(density.sum().item())
 
         mask = generate_instance_mask(
             shape,
@@ -271,6 +264,7 @@ def visualize_image_and_density(
     show_count: bool = True,
     use_precomputed_density: bool = False,
     model: Optional[torch.nn.Module] = None,
+    pred_density_scale: float = 1.0,
     save_path: Optional[Union[str, Path]] = "visualization.png",
     show: bool = False,
 ) -> None:
@@ -284,6 +278,7 @@ def visualize_image_and_density(
     use_precomputed_density: when True, load density from dataset.density_map_dir instead of recomputing.
     model: optional torch.nn.Module. When provided, the model is evaluated on the image and its
            predicted density is shown alongside the ground-truth density.
+    pred_density_scale: divide predicted map sum by this to get count (match train(..., density_scale=...)).
     """
     # image_name can be a stem, filename, or a relative path such as
     # "part_A/train_data/images/IMG_1.jpg".
@@ -371,7 +366,7 @@ def visualize_image_and_density(
             if pred.ndim == 3 and pred.shape[0] == 1:
                 pred = pred.squeeze(0)
             pred_arr = pred.numpy()
-            pred_count = float(pred_arr.sum() / getattr(dataset, "density_scale", 1.0))
+            pred_count = float(pred_arr.sum() / pred_density_scale)
 
     has_dots = ann_type == AnnotationType.DOT and annotations
 
