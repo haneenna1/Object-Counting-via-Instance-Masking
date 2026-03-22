@@ -3,19 +3,23 @@ Unified object counting dataset: loads images and produces density maps and inst
 according to annotation type (dot, bbox, segmentation).
 """
 
+import random
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import numpy as np
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torchvision.io import read_image
 
 from .annotation_types import AnnotationType
 from .density import generate_density
 from .masking import generate_instance_mask
+from .transforms import crop_sample, horizontal_flip_transform
 
 
 # Sentinel: use per-image default location <image_path>/../density_maps/<stem>_density.npy
@@ -68,6 +72,99 @@ def _density_map_path_for_sample(
     return Path(density_map_dir) / f"{stem}_density.npy"
 
 
+class PatchAugmentedDataset(Dataset):
+    """
+    Expand each base sample into CSRNet-style quarter-sized training patches.
+
+    For every image this wrapper yields:
+    - 4 fixed quarter crops (top-left, top-right, bottom-left, bottom-right)
+    - 5 additional random crops of the same size
+    - optional horizontal mirrors of all crops
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        *,
+        random_crops_per_image: int = 5,
+        mirror: bool = True,
+        seed: int = 0,
+    ) -> None:
+        if random_crops_per_image < 0:
+            raise ValueError("random_crops_per_image must be >= 0")
+
+        self.dataset = dataset
+        self.random_crops_per_image = random_crops_per_image
+        self.mirror = mirror
+        self.seed = seed
+
+        self.base_variants_per_image = 4 + self.random_crops_per_image
+        self.variants_per_image = self.base_variants_per_image * (2 if self.mirror else 1)
+
+    def __len__(self) -> int:
+        return len(self.dataset) * self.variants_per_image
+
+    def decode_variant_index(self, variant_idx: int) -> Tuple[int, bool]:
+        if variant_idx < 0 or variant_idx >= self.variants_per_image:
+            raise IndexError("CSRNetPatchAugmentedDataset variant index out of range")
+        flip = self.mirror and variant_idx >= self.base_variants_per_image
+        crop_variant = variant_idx % self.base_variants_per_image
+        return crop_variant, flip
+
+    def _crop_params(
+        self,
+        base_idx: int,
+        crop_variant: int,
+        height: int,
+        width: int,
+    ) -> Tuple[int, int, int, int]:
+        crop_h = max(1, height // 2)
+        crop_w = max(1, width // 2)
+        max_top = max(height - crop_h, 0)
+        max_left = max(width - crop_w, 0)
+
+        if crop_variant < 4:
+            quarter_offsets = (
+                (0, 0),
+                (0, max_left),
+                (max_top, 0),
+                (max_top, max_left),
+            )
+            top, left = quarter_offsets[crop_variant]
+            return top, left, crop_h, crop_w
+
+        random_crop_slot = crop_variant - 4
+        rng_seed = self.seed + base_idx * 1009 + random_crop_slot * 9176
+        rng = random.Random(rng_seed)
+        top = rng.randint(0, max_top) if max_top > 0 else 0
+        left = rng.randint(0, max_left) if max_left > 0 else 0
+        return top, left, crop_h, crop_w
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError("CSRNetPatchAugmentedDataset index out of range")
+
+        base_idx, variant_idx = divmod(idx, self.variants_per_image) # base_idx: index of the original img, variant_idx: index of the variant of same img
+        crop_variant, flip = self.decode_variant_index(variant_idx)
+
+        sample = self.dataset[base_idx]
+        _, height, width = sample["image"].shape
+        top, left, crop_h, crop_w = self._crop_params(
+            base_idx,
+            crop_variant,
+            height,
+            width,
+        )
+        sample = crop_sample(sample, top=top, left=left, crop_h=crop_h, crop_w=crop_w)
+
+        if flip:
+            sample = horizontal_flip_transform(sample, p=1.0)
+
+        return sample
+
+
 class ObjectCountingDataset(Dataset):
     """
     Dataset that yields tensors:
@@ -90,7 +187,7 @@ class ObjectCountingDataset(Dataset):
         density_geometry_adaptive: bool = False,
         density_beta: float = 0.3,
         density_k: int = 3,
-        density_min_sigma: float = 1.0,
+        density_min_sigma: float = 4.0,
         density_sigma_scale_bbox: float = 0.25,
         density_sigma_from_seg_area: bool = True,
         density_fixed_sigma_seg: float = 4.0,
@@ -293,6 +390,132 @@ def precompute_density_maps(
     return effective
 
 
+def visualize_csrnet_patch_augmented_dataset(
+    dataset: PatchAugmentedDataset,
+    base_idx: int = 0,
+    *,
+    include_mirrored: bool = False,
+    figsize_per_panel: Tuple[float, float] = (4.0, 4.0),
+    save_path: Optional[Union[str, Path]] = "csrnet_patch_visualization.png",
+    show: bool = True,
+) -> None:
+    """
+    Visualize one original image together with all CSRNet quarter-sized patches.
+
+    The first panel shows the original image with crop boxes overlaid.
+    The remaining panels show the cropped patches in the same order used by
+    PatchAugmentedDataset.
+    """
+    if base_idx < 0 or base_idx >= len(dataset.dataset):
+        raise IndexError("base_idx out of range for base dataset")
+    if not isinstance(dataset.dataset, ObjectCountingDataset):
+        raise TypeError(
+            "visualize_csrnet_patch_augmented_dataset expects "
+            "CSRNetPatchAugmentedDataset wrapping ObjectCountingDataset."
+        )
+
+    base_dataset = dataset.dataset
+    item = base_dataset.samples[base_idx]
+    image_path = item["image_path"]
+    if base_dataset.root is not None:
+        image_path = base_dataset.root / image_path
+    else:
+        image_path = Path(image_path)
+
+    image = _load_image(image_path)
+    _, height, width = image.shape
+    image_np = image.permute(1, 2, 0).cpu().numpy()
+
+    patch_panels: List[Tuple[str, np.ndarray, Tuple[int, int, int, int], bool]] = []
+    total_variants = dataset.variants_per_image if include_mirrored and dataset.mirror else dataset.base_variants_per_image
+
+    for variant_idx in range(total_variants):
+        crop_variant, flip = dataset.decode_variant_index(variant_idx)
+        top, left, crop_h, crop_w = dataset._crop_params(
+            base_idx,
+            crop_variant,
+            height,
+            width,
+        )
+        patch = image[:, top : top + crop_h, left : left + crop_w]
+        if flip:
+            patch = torch.flip(patch, dims=[2])
+
+        if crop_variant < 4:
+            label = f"Quarter {crop_variant + 1}"
+        else:
+            label = f"Random {crop_variant - 3}"
+        if flip:
+            label += " (mirrored)"
+
+        patch_panels.append(
+            (
+                label,
+                patch.permute(1, 2, 0).cpu().numpy(),
+                (top, left, crop_h, crop_w),
+                flip,
+            )
+        )
+
+    total_panels = 1 + len(patch_panels)
+    cols = min(5, total_panels)
+    rows = (total_panels + cols - 1) // cols
+    fig, axes = plt.subplots(
+        rows,
+        cols,
+        figsize=(figsize_per_panel[0] * cols, figsize_per_panel[1] * rows),
+    )
+    axes = np.atleast_1d(axes).reshape(rows, cols)
+    axes_flat = axes.ravel()
+
+    ax_original = axes_flat[0]
+    ax_original.imshow(image_np)
+    ax_original.set_title(f"Original image #{base_idx}")
+    ax_original.axis("off")
+
+    box_colors = ["tab:red", "tab:blue", "tab:green", "tab:purple"]
+    random_color = "tab:orange"
+    for crop_idx, (label, _, (top, left, crop_h, crop_w), _) in enumerate(patch_panels):
+        color = box_colors[crop_idx] if crop_idx < 4 else random_color
+        rect = Rectangle(
+            (left, top),
+            crop_w,
+            crop_h,
+            fill=False,
+            edgecolor=color,
+            linewidth=2,
+            linestyle="--" if "mirrored" in label else "-",
+        )
+        ax_original.add_patch(rect)
+        ax_original.text(
+            left + 4,
+            top + 18,
+            label,
+            color="white",
+            fontsize=8,
+            bbox={"facecolor": color, "alpha": 0.8, "pad": 2},
+        )
+
+    for panel_idx, (label, patch_np, _, _) in enumerate(patch_panels, start=1):
+        ax = axes_flat[panel_idx]
+        ax.imshow(patch_np)
+        ax.set_title(label)
+        ax.axis("off")
+
+    for ax in axes_flat[total_panels:]:
+        ax.axis("off")
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        plt.savefig(str(save_path), dpi=150)
+
+    if show:
+        plt.show()
+
+    plt.close(fig)
+
+
 def visualize_image_and_density(
     dataset: ObjectCountingDataset,
     image_name: str,
@@ -301,6 +524,7 @@ def visualize_image_and_density(
     density_cmap: str = "jet",
     show_count: bool = True,
     use_precomputed_density: bool = False,
+    adaptive: bool = True,
     model: Optional[torch.nn.Module] = None,
     pred_density_scale: float = 1.0,
     save_path: Optional[Union[str, Path]] = "visualization.png",
@@ -326,7 +550,7 @@ def visualize_image_and_density(
 
     sample: Optional[Dict[str, Any]] = None
 
-    print(f"visualization: image name={image_name_path} precomputed density={use_precomputed_density} adaptive={dataset.density_geometry_adaptive} beta={dataset.density_beta} k={dataset.density_k} min_sigma={dataset.density_min_sigma}")
+    print(f"visualization: image name={image_name_path} precomputed density={use_precomputed_density} adaptive={adaptive} beta={dataset.density_beta} k={dataset.density_k} min_sigma={dataset.density_min_sigma}")
 
     # 1) Prefer exact relative-path match against item["image_path"].
     for item in dataset.samples:
@@ -386,7 +610,7 @@ def visualize_image_and_density(
             ann_type,
             annotations,
             sigma=dataset.density_sigma,
-            geometry_adaptive=dataset.density_geometry_adaptive,
+            geometry_adaptive=adaptive,
             beta=dataset.density_beta,
             k=dataset.density_k,
             min_sigma=dataset.density_min_sigma,
@@ -412,8 +636,21 @@ def visualize_image_and_density(
                 pred = pred.squeeze(0)
             if pred.ndim == 3 and pred.shape[0] == 1:
                 pred = pred.squeeze(0)
-            pred_arr = pred.numpy()
-            pred_count = float(pred_arr.sum() / pred_density_scale)
+            pred_count = float(pred.sum().item() / pred_density_scale)
+
+            pred_h, pred_w = pred.shape[-2], pred.shape[-1]
+            H_gt, W_gt = density.shape[:2]
+            if pred_h != H_gt or pred_w != W_gt:
+                density_t = torch.from_numpy(density).unsqueeze(0).unsqueeze(0).float()
+                density_t = F.interpolate(
+                    density_t, size=(pred_h, pred_w),
+                    mode="bilinear", align_corners=False,
+                )
+                spatial_scale = (H_gt * W_gt) / (pred_h * pred_w)
+                density_t = density_t * spatial_scale
+                density = density_t.squeeze().numpy()
+                count = float(density.sum())
+            pred_arr = pred.squeeze().numpy()
 
     has_dots = ann_type == AnnotationType.DOT and annotations
 
@@ -453,7 +690,7 @@ def visualize_image_and_density(
         ax_dots.axis("off")
 
     im = ax_den.imshow(density, cmap=density_cmap)
-    ax_den.set_title(f"GT density" + (f" (count ≈ {count:.1f}) adaptive={dataset.density_geometry_adaptive} beta={dataset.density_beta} k={dataset.density_k} min_sigma={dataset.density_min_sigma}"  if show_count else ""))
+    ax_den.set_title(f"GT density" + (f"\n(count ≈ {count:.1f})" + f"\nadaptive={adaptive} " + f"beta={dataset.density_beta} " + f"\nk={dataset.density_k} " + f"min_sigma={dataset.density_min_sigma} "  if show_count else ""))
     ax_den.axis("off")
     plt.colorbar(im, ax=ax_den, fraction=0.046, pad=0.04)
 

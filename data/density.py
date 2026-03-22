@@ -49,8 +49,9 @@ def _density_from_points(
     geometry_adaptive: bool = True,
     k: int = 3,
     beta: float = 0.3,
-    min_sigma: float = 1.0,
+    min_sigma: float = 4.0,
     max_sigma: float = 15.0,
+    **kwargs,
 ) -> np.ndarray:
     """
     Generate density map using geometry-adaptive kernels (CSRNet/MCNN style).
@@ -59,7 +60,6 @@ def _density_from_points(
         shape: (H, W)
         points: list of (x, y)
     """
-
     H, W = shape
     density = np.zeros((H, W), dtype=np.float64)
 
@@ -81,11 +81,10 @@ def _density_from_points(
         mean_dists = dists.mean(axis=1)
 
         sigmas = beta * mean_dists
-        sigmas = np.clip(sigmas, min_sigma, max_sigma)
+        # sigmas = np.clip(sigmas, min_sigma, max_sigma)
 
     else:
         sigmas = np.full(len(points), sigma, dtype=np.float64)
-
     # -----------------------------------------------------
     # Place Gaussians (local patches)
     # -----------------------------------------------------
@@ -120,7 +119,7 @@ def _density_from_points(
 # BBOX HANDLER
 # ---------------------------------------------------------
 
-def _density_from_bboxes(shape, bboxes, params):
+def _density_from_bboxes(shape, bboxes, params, **kwargs):
 
     sigma_scale = params["sigma_scale_bbox"]
 
@@ -147,7 +146,7 @@ def _density_from_bboxes(shape, bboxes, params):
 # SEGMENTATION HANDLER
 # ---------------------------------------------------------
 
-def _density_from_segmentations(shape, masks, params):
+def _density_from_segmentations(shape, masks, params, **kwargs):
 
     sigma_from_area = params["sigma_from_seg_area"]
     fixed_sigma = params["fixed_sigma_seg"]
@@ -215,7 +214,7 @@ def generate_density(
     geometry_adaptive: bool = False,
     beta: float = 0.3,
     k: int = 3,
-    min_sigma: float = 1.0,
+    min_sigma: float = 4.0,
 ) -> np.ndarray:
 
     """
@@ -249,4 +248,4 @@ def generate_density(
     except KeyError:
         raise ValueError(f"Unsupported annotation_type: {annotation_type}")
 
-    return handler(shape, annotations, params)
+    return handler(shape, annotations, **params)

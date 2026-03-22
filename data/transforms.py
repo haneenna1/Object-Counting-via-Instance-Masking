@@ -7,6 +7,34 @@ import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 
 
+def _update_sample_count(sample):
+    if "count" in sample:
+        sample["count"] = torch.tensor(
+            float(sample["density"].sum().item()),
+            dtype=sample["density"].dtype,
+            device=sample["density"].device,
+        )
+    return sample
+
+
+def crop_sample(sample, top: int, left: int, crop_h: int, crop_w: int):
+    image = sample["image"]
+    density = sample["density"]
+    mask = sample["mask"]
+
+    sample["image"] = image[:, top : top + crop_h, left : left + crop_w]
+    sample["density"] = density[:, top : top + crop_h, left : left + crop_w]
+    sample["mask"] = mask[:, top : top + crop_h, left : left + crop_w]
+
+    if "original_image" in sample:
+        original_image = sample["original_image"]
+        sample["original_image"] = original_image[
+            :, top : top + crop_h, left : left + crop_w
+        ]
+
+    return _update_sample_count(sample)
+
+
 def resize_transform(sample, size=(512, 512)):
     image = sample["image"]
     _, h, w = image.shape
@@ -40,7 +68,7 @@ def resize_transform(sample, size=(512, 512)):
     sample["density"] = density
     sample["mask"] = mask
 
-    return sample
+    return _update_sample_count(sample)
 
 
 def random_crop_transform(sample, crop_size=(256, 256)):
@@ -55,10 +83,6 @@ def random_crop_transform(sample, crop_size=(256, 256)):
     pad_h = max(crop_h - H, 0)
     pad_w = max(crop_w - W, 0)
 
-    b_im_sh = image.shape
-    b_d_sh = density.shape
-    b_msk_sh = mask.shape
-
     if pad_h > 0 or pad_w > 0:
         image = F.pad(image, (0, pad_w, 0, pad_h))
         density = F.pad(density, (0, pad_w, 0, pad_h))
@@ -71,15 +95,11 @@ def random_crop_transform(sample, crop_size=(256, 256)):
     top = random.randint(0, H - crop_h)
     left = random.randint(0, W - crop_w)
 
-    image = image[:, top : top + crop_h, left : left + crop_w]
-    density = density[:, top : top + crop_h, left : left + crop_w]
-    mask = mask[:, top : top + crop_h, left : left + crop_w]
-
     sample["image"] = image
     sample["density"] = density
     sample["mask"] = mask
 
-    return sample
+    return crop_sample(sample, top=top, left=left, crop_h=crop_h, crop_w=crop_w)
 
 
 def horizontal_flip_transform(sample, p: float = 0.5):

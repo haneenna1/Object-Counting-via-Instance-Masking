@@ -6,7 +6,11 @@ Supports dotted, bbox, and segmentation annotations.
 from .annotation_types import AnnotationType
 from .density import generate_density
 from .masking import generate_instance_mask
-from .dataset import ObjectCountingDataset
+from .dataset import (
+    PatchAugmentedDataset,
+    ObjectCountingDataset,
+    visualize_csrnet_patch_augmented_dataset,
+)
 from .shanghaitech import (
     build_shanghaitech_samples,
     load_shanghaitech_dataset,
@@ -22,7 +26,9 @@ __all__ = [
     "AnnotationType",
     "generate_density",
     "generate_instance_mask",
+    "PatchAugmentedDataset",
     "ObjectCountingDataset",
+    "visualize_csrnet_patch_augmented_dataset",
     "build_shanghaitech_samples",
     "load_shanghaitech_dataset",
     "ShanghaiTechDataset",
