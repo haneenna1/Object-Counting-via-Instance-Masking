@@ -39,3 +39,4 @@ dependencies:
   - pip:
       - albumentations
       - kagglehub
+      - timm

@@ -32,6 +32,7 @@ from data.transforms import (
 )
 from model.unet import UNetDensity
 from model.csrnet import CSRNet, load_vgg16_frontend
+from model.vit_density import ViTDensity
 from training.train import train, DEFAULT_DENSITY_SCALE
 
 def visualize_sample(sample, model=None, density_scale: float = DEFAULT_DENSITY_SCALE):
@@ -82,7 +83,7 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         default="csrnet",
-        choices=["unet", "csrnet"],
+        choices=["unet", "csrnet", "vit"],
         help="Which density model to train.",
     )
     parser.add_argument(
@@ -127,6 +128,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_DENSITY_SCALE,
         help="Training only: MSE target = raw_gt * scale; count from pred = pred.sum()/scale. "
         "Must match when visualizing trained checkpoints.",
+    )
+    parser.add_argument(
+        "--freeze-encoder",
+        action="store_true",
+        help="Freeze the pretrained encoder (VGG for CSRNet, ViT for vit).",
     )
     parser.add_argument(
         "--single-image",
@@ -207,7 +213,13 @@ if __name__ == "__main__":
         model = UNetDensity()
     elif args.model == "csrnet":
         model = CSRNet()
-        load_vgg16_frontend(model, freeze_frontend=False)
+        load_vgg16_frontend(model, freeze_frontend=args.freeze_encoder)
+    elif args.model == "vit":
+        model = ViTDensity(
+            encoder_name="vit_base_patch16_224",
+            pretrained=True,
+            freeze_encoder=args.freeze_encoder,
+        )
     else:
         raise ValueError(f"Unknown model {args.model!r}")
 

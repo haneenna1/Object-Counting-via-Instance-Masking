@@ -348,6 +348,8 @@ def train(
 
         scheduler.step(val_mae)
 
+        current_lr = optimizer.param_groups[0]["lr"]
+
         history["train_loss"].append(train_loss)
         history["train_mae"].append(train_mae)
         if val_mae is not None:
@@ -358,6 +360,7 @@ def train(
         if val_mae is not None:
             print(
                 f"Epoch {epoch:03d} | "
+                f"lr {current_lr:.2e} | "
                 f"total loss {train_loss:.4f} | "
                 f"Train MAE {train_mae:.2f} | "
                 f"weighted train mae {train_mae * count_loss_weight:.4f} | "
@@ -394,6 +397,7 @@ def train(
         else:
             print(
                 f"Epoch {epoch:03d} | "
+                f"lr {current_lr:.2e} | "
                 f"total loss {train_loss:.4f} | "
                 f"Train MAE {train_mae:.2f} | "
                 f"weighted train mae {train_mae * count_loss_weight:.4f} | "

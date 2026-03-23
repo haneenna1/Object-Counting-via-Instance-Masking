@@ -91,6 +91,22 @@ class CSRNet(nn.Module):
         # final 1x1 conv to regress density
         self.out = nn.Conv2d(64, 1, kernel_size=1)
 
+        self._init_backend_weights()
+
+    def _init_backend_weights(self):
+        """Gaussian init (std=0.01) for back-end layers, as described in the CSRNet paper."""
+        backend_modules = [
+            self.dilated5_1, self.dilated5_2, self.dilated5_3,
+            self.dilated6_1, self.dilated6_2, self.dilated6_3,
+            self.out,
+        ]
+        for module in backend_modules:
+            for m in module.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.normal_(m.weight, std=0.01)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # front-end
         x = self.conv1_1(x)
