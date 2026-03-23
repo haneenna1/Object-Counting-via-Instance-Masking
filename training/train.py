@@ -8,16 +8,47 @@ Dataset yields raw density (sum ≈ count). Training uses density_scale only her
 """
 
 import json
+import random
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import BatchSampler, DataLoader
 from tqdm import tqdm
+
+from data.dataset import PatchAugmentedDataset
+from data.dataset import visualize_image_and_density
+
 
 # Default training scale (only applied in this module, not in dataset).
 DEFAULT_DENSITY_SCALE = 255.0
+
+
+class PatchBatchSampler(BatchSampler):
+    """
+    Yield one full patch group per batch for PatchAugmentedDataset.
+
+    Each batch contains all variants generated from a single base image,
+    which keeps spatial shapes consistent inside the batch.
+    """
+
+    def __init__(self, dataset: PatchAugmentedDataset, shuffle: bool = True):
+        self.dataset = dataset
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        base_indices = list(range(len(self.dataset.dataset)))
+        if self.shuffle:
+            random.shuffle(base_indices)
+
+        group_size = self.dataset.variants_per_image
+        for base_idx in base_indices:
+            start = base_idx * group_size
+            yield list(range(start, start + group_size))
+
+    def __len__(self) -> int:
+        return len(self.dataset.dataset)
 
 
 # -----------------------------
@@ -63,6 +94,31 @@ def compute_loss(
 
 
 # -----------------------------
+# Count helpers
+# -----------------------------
+def _counts_from_densities(pred_density, gt_density, density_scale):
+    """
+    Derive predicted and GT counts, handling the resolution mismatch
+    between CSRNet-style 1/8-res predictions and full-res GT.
+    """
+    if pred_density.shape[-2:] != gt_density.shape[-2:]:
+        H_gt, W_gt = gt_density.shape[-2:]
+        H_pred, W_pred = pred_density.shape[-2:]
+        gt_down = F.interpolate(
+            gt_density, size=(H_pred, W_pred),
+            mode="bilinear", align_corners=False,
+        )
+        spatial_scale = (H_gt / H_pred) * (W_gt / W_pred)
+        gt_down = gt_down * spatial_scale
+        gt_count = gt_down.sum(dim=(1, 2, 3))
+    else:
+        gt_count = gt_density.sum(dim=(1, 2, 3))
+
+    pred_count = pred_density.sum(dim=(1, 2, 3)) / density_scale
+    return pred_count, gt_count
+
+
+# -----------------------------
 # Train for one epoch
 # -----------------------------
 def train_one_epoch(
@@ -97,6 +153,11 @@ def train_one_epoch(
             loss_mode=loss_mode,
             density_scale=density_scale,
         )
+        with torch.no_grad():
+            pred_count, gt_count = _counts_from_densities(
+                pred_density, gt_density, density_scale
+            )
+        mae = torch.abs(pred_count - gt_count).sum()
 
         loss.backward()
         optimizer.step()
@@ -105,10 +166,6 @@ def train_one_epoch(
 
         total_loss += loss.item() * batch_size
 
-        pred_count = pred_density.sum(dim=(1, 2, 3)) / density_scale
-        gt_count = gt_density.sum(dim=(1, 2, 3))
-
-        mae = torch.abs(pred_count - gt_count).sum()
 
         total_mae += mae.item()
         total_samples += batch_size
@@ -137,9 +194,9 @@ def validate(model, dataloader, device, density_scale: float = DEFAULT_DENSITY_S
 
         pred_density = model(images)
 
-        pred_count = pred_density.sum(dim=(1, 2, 3)) / density_scale
-        gt_count = gt_density.sum(dim=(1, 2, 3))
-
+        pred_count, gt_count = _counts_from_densities(
+            pred_density, gt_density, density_scale
+        )
         mae = torch.abs(pred_count - gt_count).sum()
 
         total_mae += mae.item()
@@ -159,7 +216,8 @@ def plot_training_curves(history, save_path: str | Path):
 
     plt.plot(epochs, history["train_loss"], label="Train Loss")
     plt.plot(epochs, history["train_mae"], label="Train MAE")
-    plt.plot(epochs, history["val_mae"], label="Validation MAE")
+    if history["val_mae"]:
+        plt.plot(epochs, history["val_mae"], label="Validation MAE")
 
     plt.xlabel("Epoch")
     plt.ylabel("Metric")
@@ -177,17 +235,18 @@ def plot_training_curves(history, save_path: str | Path):
 def train(
     model,
     train_dataset,
-    val_dataset,
+    val_dataset=None,
     epochs: int = 100,
     batch_size: int = 8,
     count_loss_weight: float = 1.0,
     loss_mode: str = "density_mse_count_l1",
-    early_stopping_patience: int | None = 15,
+    early_stopping_patience: int | None = 30,
     model_name: str = "model",
     data_name: str = "data",
     mask_ratio: float | None = None,
     output_dir: str | Path = "trained_models",
     density_scale: float = DEFAULT_DENSITY_SCALE,
+    validate_during_training: bool = True,
 ):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -200,25 +259,58 @@ def train(
 
     model = model.to(device)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=8,
-        pin_memory=True,
-    )
+    if isinstance(train_dataset, PatchAugmentedDataset):
+        effective_batch_size = train_dataset.variants_per_image
+        print(
+            "Detected CSRNetPatchAugmentedDataset for training. "
+            f"Using one image per batch ({effective_batch_size} patches)."
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=PatchBatchSampler(train_dataset, shuffle=True),
+            num_workers=8,
+            pin_memory=True,
+        )
+        val_batch_size=1
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=8,
+            pin_memory=True,
+        )
+        val_batch_size=batch_size
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-    )
+    val_loader = None
+    if validate_during_training:
+        if val_dataset is None:
+            raise ValueError(
+                "val_dataset must be provided when validate_during_training=True."
+            )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=val_batch_size,
+            shuffle=False,
+            num_workers=8,
+            pin_memory=True,
+        )
+    elif early_stopping_patience is not None:
+        print(
+            "Validation disabled: early stopping requires validation MAE and will be ignored."
+        )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-
-    output_dir = Path(output_dir)
+    # optimizer = torch.optim.SGD(model.parameters(), lr=0.1e-6)
+    #add lr scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.1,
+        patience=10,
+        # verbose=True
+    )
+    output_dir = Path(output_dir) / model_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     mask_str = "nomsk" if mask_ratio is None else str(mask_ratio)
@@ -244,44 +336,70 @@ def train(
             loss_mode=loss_mode,
             density_scale=density_scale,
         )
+        
+        val_mae = None
+        if validate_during_training:
+            val_mae = validate(
+                model,
+                val_loader,
+                device,
+                density_scale=density_scale,
+            )
 
-        val_mae = validate(
-            model,
-            val_loader,
-            device,
-            density_scale=density_scale,
-        )
+        scheduler.step(val_mae)
 
         history["train_loss"].append(train_loss)
         history["train_mae"].append(train_mae)
-        history["val_mae"].append(val_mae)
+        if val_mae is not None:
+            history["val_mae"].append(val_mae)
 
         plot_training_curves(history, output_dir / f"{run_name}-curves.png")
 
-        print(
-            f"Epoch {epoch:03d} | "
-            f"total loss {train_loss:.4f} | "
-            f"Train MAE {train_mae:.2f} | "
-            f"weighted train mae {train_mae * count_loss_weight:.4f} | "
-            f"train density mse {train_loss - train_mae * count_loss_weight:.4f} | "
-            f"Val MAE {val_mae:.2f}"
-        )
-
-        if val_mae < best_mae:
-            best_mae = val_mae
-            model_path = output_dir / f"{run_name}.pth"
-            torch.save(model.state_dict(), model_path)
-            print(f"Saved best model to {model_path}")
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
-
-        if early_stopping_patience is not None and epochs_without_improvement >= early_stopping_patience:
+        if val_mae is not None:
             print(
-                f"Early stopping triggered after {epoch} epochs "
-                f"(no improvement in val MAE for {early_stopping_patience} epochs)."
+                f"Epoch {epoch:03d} | "
+                f"total loss {train_loss:.4f} | "
+                f"Train MAE {train_mae:.2f} | "
+                f"weighted train mae {train_mae * count_loss_weight:.4f} | "
+                f"train density mse {train_loss - train_mae * count_loss_weight:.4f} | "
+                f"Val MAE {val_mae:.2f}"
             )
-            break
+
+            if val_mae < best_mae:
+                best_mae = val_mae
+                model_path = output_dir / f"{run_name}.pth"
+                torch.save(model.state_dict(), model_path)
+                print(f"Saved best model to {model_path}")
+                epochs_without_improvement = 0
+
+                base_ds = val_loader.dataset.dataset
+                first_idx = val_loader.dataset.indices[0]
+                visualize_image_and_density(
+                    base_ds,
+                    base_ds.samples[first_idx]["image_path"],
+                    use_precomputed_density=True,
+                    pred_density_scale=density_scale,
+                    save_path=output_dir / f"{run_name}-val-visu.png",
+                    model=model,
+                )
+            else:
+                epochs_without_improvement += 1
+
+            if early_stopping_patience is not None and epochs_without_improvement >= early_stopping_patience:
+                print(
+                    f"Early stopping triggered after {epoch} epochs "
+                    f"(no improvement in val MAE for {early_stopping_patience} epochs)."
+                )
+                break
+        else:
+            print(
+                f"Epoch {epoch:03d} | "
+                f"total loss {train_loss:.4f} | "
+                f"Train MAE {train_mae:.2f} | "
+                f"weighted train mae {train_mae * count_loss_weight:.4f} | "
+                f"train density mse {train_loss - train_mae * count_loss_weight:.4f}"
+            )
+            
 
     history_path = output_dir / f"{run_name}-history.json"
     with open(history_path, "w") as f:

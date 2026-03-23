@@ -14,7 +14,7 @@ import torch
 # # )
 if __name__ == "__main__":
     model = CSRNet()
-    model.load_state_dict(torch.load("trained_models/csrnet-shng-nomsk.pth"))
+    model.load_state_dict(torch.load("trained_models/csrnet/csrnet-shng-nomsk.pth"))
 
     dataset = load_shanghaitech_dataset(
         root="/home/haneenn/.cache/kagglehub/datasets/tthien/shanghaitech/versions/1/ShanghaiTech",
