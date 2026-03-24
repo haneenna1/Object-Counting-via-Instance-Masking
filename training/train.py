@@ -236,17 +236,22 @@ def train(
     model,
     train_dataset,
     val_dataset=None,
-    epochs: int = 100,
+    epochs: int = 400,
     batch_size: int = 8,
     count_loss_weight: float = 1.0,
     loss_mode: str = "density_mse_count_l1",
-    early_stopping_patience: int | None = 30,
+    early_stopping_patience: int | None = None,
     model_name: str = "model",
     data_name: str = "data",
     mask_ratio: float | None = None,
+    mask_mode: str | None = None,
     output_dir: str | Path = "trained_models",
     density_scale: float = DEFAULT_DENSITY_SCALE,
     validate_during_training: bool = True,
+    optimizer_type: str = "sgd",
+    lr: float = 1e-7,
+    momentum: float = 0.95,
+    weight_decay: float = 5e-4,
 ):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -254,7 +259,10 @@ def train(
     print(
         f"Training {model_name} model on {data_name} dataset on",
         device,
-        f"with {epochs} epochs: , batch size: {batch_size}, loss mode: {loss_mode}, count loss weight: {count_loss_weight}, density scale: {density_scale}"
+        f"with {epochs} epochs, batch size: {batch_size}, loss mode: {loss_mode}, "
+        f"count loss weight: {count_loss_weight}, density scale: {density_scale}, "
+        f"mask ratio: {mask_ratio}, mask mode: {mask_mode}, "
+        f"optimizer: {optimizer_type}, lr: {lr}"
     )
 
     model = model.to(device)
@@ -300,20 +308,22 @@ def train(
             "Validation disabled: early stopping requires validation MAE and will be ignored."
         )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    # optimizer = torch.optim.SGD(model.parameters(), lr=0.1e-6)
-    #add lr scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.1,
-        patience=10,
-        # verbose=True
-    )
+    if optimizer_type == "sgd":
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=lr,
+            momentum=momentum, weight_decay=weight_decay,
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=lr, weight_decay=weight_decay,
+        )
     output_dir = Path(output_dir) / model_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    mask_str = "nomsk" if mask_ratio is None else str(mask_ratio)
+    if mask_ratio is None:
+        mask_str = "nomsk"
+    else:
+        mask_str = f"{mask_ratio}-{mask_mode or 'inpaint'}"
     run_name = f"{model_name}-{data_name}-{mask_str}"
 
     best_mae = float("inf")
@@ -324,6 +334,16 @@ def train(
         "train_mae": [],
         "val_mae": [],
     }
+
+    # Resolve base dataset + first sample index for val visualization.
+    if val_loader is not None:
+        _vds = val_loader.dataset
+        if hasattr(_vds, "dataset") and hasattr(_vds, "indices"):
+            _vis_base_ds = _vds.dataset
+            _vis_first_idx = _vds.indices[0]
+        else:
+            _vis_base_ds = _vds
+            _vis_first_idx = 0
 
     for epoch in range(1, epochs + 1):
 
@@ -346,8 +366,6 @@ def train(
                 density_scale=density_scale,
             )
 
-        scheduler.step(val_mae)
-
         current_lr = optimizer.param_groups[0]["lr"]
 
         history["train_loss"].append(train_loss)
@@ -357,29 +375,35 @@ def train(
 
         plot_training_curves(history, output_dir / f"{run_name}-curves.png")
 
+        # Save latest checkpoint every epoch (for resuming).
+        latest_path = output_dir / f"{run_name}-latest.pth"
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_mae": best_mae,
+        }, latest_path)
+
         if val_mae is not None:
             print(
                 f"Epoch {epoch:03d} | "
                 f"lr {current_lr:.2e} | "
                 f"total loss {train_loss:.4f} | "
                 f"Train MAE {train_mae:.2f} | "
-                f"weighted train mae {train_mae * count_loss_weight:.4f} | "
-                f"train density mse {train_loss - train_mae * count_loss_weight:.4f} | "
-                f"Val MAE {val_mae:.2f}"
+                f"Val MAE {val_mae:.2f} | "
+                f"Best MAE {best_mae:.2f}"
             )
 
             if val_mae < best_mae:
                 best_mae = val_mae
-                model_path = output_dir / f"{run_name}.pth"
+                model_path = output_dir / f"{run_name}-best.pth"
                 torch.save(model.state_dict(), model_path)
-                print(f"Saved best model to {model_path}")
+                print(f" * New best MAE {best_mae:.2f} — saved to {model_path}")
                 epochs_without_improvement = 0
 
-                base_ds = val_loader.dataset.dataset
-                first_idx = val_loader.dataset.indices[0]
                 visualize_image_and_density(
-                    base_ds,
-                    base_ds.samples[first_idx]["image_path"],
+                    _vis_base_ds,
+                    _vis_base_ds.samples[_vis_first_idx]["image_path"],
                     use_precomputed_density=True,
                     pred_density_scale=density_scale,
                     save_path=output_dir / f"{run_name}-val-visu.png",
@@ -388,7 +412,10 @@ def train(
             else:
                 epochs_without_improvement += 1
 
-            if early_stopping_patience is not None and epochs_without_improvement >= early_stopping_patience:
+            if (
+                early_stopping_patience is not None
+                and epochs_without_improvement >= early_stopping_patience
+            ):
                 print(
                     f"Early stopping triggered after {epoch} epochs "
                     f"(no improvement in val MAE for {early_stopping_patience} epochs)."
@@ -399,11 +426,8 @@ def train(
                 f"Epoch {epoch:03d} | "
                 f"lr {current_lr:.2e} | "
                 f"total loss {train_loss:.4f} | "
-                f"Train MAE {train_mae:.2f} | "
-                f"weighted train mae {train_mae * count_loss_weight:.4f} | "
-                f"train density mse {train_loss - train_mae * count_loss_weight:.4f}"
+                f"Train MAE {train_mae:.2f}"
             )
-            
 
     history_path = output_dir / f"{run_name}-history.json"
     with open(history_path, "w") as f:

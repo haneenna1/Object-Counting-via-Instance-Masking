@@ -5,8 +5,6 @@ import matplotlib.pyplot as plt
 
 from sympy import N
 import torch
-from torch.utils.data import DataLoader
-from torch.utils.data import random_split
 from torch.utils.data import Subset
 import kagglehub
 
@@ -89,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=200,
+        default=400,
         help="Number of training epochs.",
     )
     parser.add_argument(
@@ -108,7 +106,15 @@ def parse_args() -> argparse.Namespace:
         "--mask-ratio",
         type=float,
         default=None,
-        help="Masking ratio used during training (used in saved filenames).",
+        help="Fraction of object instances to mask per image (0..1), or None to disable masking.",
+    )
+    parser.add_argument(
+        "--mask-mode",
+        type=str,
+        default="inpaint",
+        choices=["robust", "inpaint"],
+        help="'robust': mask both image and density (robustness augmentation). "
+        "'inpaint': mask image only, keep full density target (hallucination task).",
     )
     parser.add_argument(
         "--output-dir",
@@ -119,8 +125,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--early-stopping-patience",
         type=int,
-        default=30,
-        help="Number of epochs without improvement to wait before stopping training.",
+        default=None,
+        help="Stop after N epochs without val MAE improvement. None = disabled (run all epochs).",
     )
     parser.add_argument(
         "--density-scale",
@@ -133,6 +139,31 @@ def parse_args() -> argparse.Namespace:
         "--freeze-encoder",
         action="store_true",
         help="Freeze the pretrained encoder (VGG for CSRNet, ViT for vit).",
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="sgd",
+        choices=["sgd", "adam"],
+        help="Optimizer type.",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-6,
+        help="Learning rate.",
+    )
+    parser.add_argument(
+        "--momentum",
+        type=float,
+        default=0.95,
+        help="SGD momentum (ignored for Adam).",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=5e-4,
+        help="Weight decay.",
     )
     parser.add_argument(
         "--single-image",
@@ -162,51 +193,54 @@ if __name__ == "__main__":
         normalize_imagenet_transform,
     )
 
-    dataset = load_shanghaitech_dataset(
+    dataset_kwargs = dict(
         root="/home/haneenn/.cache/kagglehub/datasets/tthien/shanghaitech/versions/1/ShanghaiTech",
         part=["part_A"],
-        split="train_data",
-        mask_object_ratio=None,
         density_map_dir=DENSITY_MAP_DIR_AUTO,
         keep_original_image=False,
-        # density_sigma=4.0,
         density_geometry_adaptive=True,
         density_beta=0.3,
         density_k=3,
         density_min_sigma=4.0,
-        # transform=transform,
     )
-    print(f"Loaded dataset with {len(dataset)} samples")
-    
-    generator = torch.Generator().manual_seed(42)
+
+    # CSRNet-style: train on full train_data, validate on test_data every epoch.
+    train_full_dataset = load_shanghaitech_dataset(
+        **dataset_kwargs,
+        split="train_data",
+        mask_object_ratio=args.mask_ratio,
+        mask_mode=args.mask_mode,
+    )
 
     if args.single_image:
-        if len(dataset) == 0:
+        if len(train_full_dataset) == 0:
             raise ValueError("Dataset is empty, cannot run single-image sanity check.")
-        if args.single_image_index < 0 or args.single_image_index >= len(dataset):
+        if args.single_image_index < 0 or args.single_image_index >= len(train_full_dataset):
             raise ValueError(
-                f"--single-image-index must be in [0, {len(dataset) - 1}], "
+                f"--single-image-index must be in [0, {len(train_full_dataset) - 1}], "
                 f"got {args.single_image_index}."
             )
-
-        single_subset = Subset(dataset, [args.single_image_index])
-        train_dataset = single_subset
-        val_dataset = single_subset
-    else:
-        train_size = int(0.7 * len(dataset))
-        val_size = len(dataset) - train_size
-        train_base_dataset, val_dataset = random_split(
-            dataset,
-            [train_size, val_size],
-            generator=generator
+        train_dataset = Subset(train_full_dataset, [args.single_image_index])
+        val_dataset = Subset(
+            load_shanghaitech_dataset(
+                **dataset_kwargs, split="train_data", mask_object_ratio=None,
+            ),
+            [args.single_image_index],
         )
+    else:
         train_dataset = PatchAugmentedDataset(
-            train_base_dataset,
+            train_full_dataset,
             random_crops_per_image=5,
             mirror=True,
             seed=42,
         )
-    print(f"Training split after CSRNet patch expansion: {len(train_dataset)} samples")
+        val_dataset = load_shanghaitech_dataset(
+            **dataset_kwargs,
+            split="test_data",
+            mask_object_ratio=None,
+        )
+
+    print(f"Train: {len(train_dataset)} samples, Val: {len(val_dataset)} samples")
 
     # Choose which density model to train based on CLI flag.
     if args.model == "unet":
@@ -232,11 +266,16 @@ if __name__ == "__main__":
         model_name=args.model,
         data_name=args.data_name,
         mask_ratio=args.mask_ratio,
+        mask_mode=args.mask_mode,
         output_dir=args.output_dir,
         early_stopping_patience=args.early_stopping_patience,
         density_scale=args.density_scale,
         batch_size=1,
         validate_during_training=not args.no_validation,
+        optimizer_type=args.optimizer,
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
     )
 
    

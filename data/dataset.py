@@ -176,6 +176,15 @@ class ObjectCountingDataset(Dataset):
         - "image_path"
         - "annotation_type": "dot" | "bbox" | "segmentation"
         - "annotations"
+
+    Instance masking (controlled by mask_object_ratio and mask_mode):
+        mask_mode="robust"  — mask applied to both image AND density.
+            Target is density of visible (unmasked) objects only.
+            Acts as a robustness augmentation: the model learns to ignore
+            missing regions and still estimate density for what it can see.
+        mask_mode="inpaint" — mask applied to image only; density stays full.
+            The model must learn to "hallucinate" / reconstruct the density
+            of masked objects from surrounding context.
     """
 
     def __init__(
@@ -195,10 +204,15 @@ class ObjectCountingDataset(Dataset):
         mask_dot_sigma_to_box: float = 2.0,
         mask_dot_sigma: float = 4.0,
         mask_object_ratio: Optional[float] = None,
+        mask_mode: str = "inpaint",
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         keep_original_image: bool = False,
         density_map_dir: Optional[Union[str, Path]] = DENSITY_MAP_DIR_AUTO,
     ):
+        if mask_mode not in ("robust", "inpaint"):
+            raise ValueError(
+                f"mask_mode must be 'robust' or 'inpaint', got {mask_mode!r}"
+            )
         self.samples = samples
         self.root = Path(root) if root else None
         self.density_sigma = density_sigma
@@ -213,6 +227,7 @@ class ObjectCountingDataset(Dataset):
         self.mask_dot_sigma_to_box = mask_dot_sigma_to_box
         self.mask_dot_sigma = mask_dot_sigma
         self.mask_object_ratio = mask_object_ratio
+        self.mask_mode = mask_mode
         self.transform = transform
         self.keep_original_image = keep_original_image
         if density_map_dir is None:
@@ -312,8 +327,17 @@ class ObjectCountingDataset(Dataset):
         if self.keep_original_image:
             out["original_image"] = out["image"].clone()
 
-        # mask: 1 = hide (object), 0 = show. (1,H,W) * (3,H,W) -> channel-wise broadcast
-        out["image"] = out["image"] * (1.0 - out["mask"].clamp(0.0, 1.0))
+        # Instance masking: binary_mask 1 = hide (object), 0 = show.
+        binary_mask = out["mask"].clamp(0.0, 1.0)
+        out["image"] = out["image"] * (1.0 - binary_mask)
+
+        if self.mask_mode == "robust":
+            # Also mask density — model learns density of visible objects only.
+            out["density"] = out["density"] * (1.0 - binary_mask)
+            out["count"] = torch.tensor(
+                float(out["density"].sum().item()), dtype=torch.float32
+            )
+        # "inpaint": density stays full — model must hallucinate masked density.
 
         return out
 
