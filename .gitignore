@@ -2,3 +2,5 @@ data/shanghaitech_data
 *.pyc
 *.vscode
 vis/
+ShanghaiTech/
+trained_models/

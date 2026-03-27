@@ -5,6 +5,7 @@ Uses normalized 2D Gaussians so that the integral over the image approximates th
 
 import numpy as np
 from typing import List, Tuple, Union
+from scipy.ndimage import gaussian_filter
 from scipy.spatial import KDTree
 
 from .annotation_types import AnnotationType
@@ -39,6 +40,45 @@ def gaussian_2d_patch(
 
 
 # ---------------------------------------------------------
+# DOT SIGMAS (shared with instance masking)
+# ---------------------------------------------------------
+
+def compute_dot_sigmas(
+    points: List[Tuple[float, float]],
+    *,
+    sigma: float = 4.0,
+    geometry_adaptive: bool = True,
+    k: int = 3,
+    beta: float = 0.3,
+    min_sigma: float = 4.0,
+    max_sigma: float = 15.0,
+) -> np.ndarray:
+    """
+    Per-point Gaussian sigmas for dot annotations (same rule as density map generation).
+
+    geometry_adaptive (when len(points) > k): sigma_i = beta * mean_kNN_distance_i.
+    Otherwise: fixed ``sigma`` for every point.
+    """
+    n = len(points)
+    if n == 0:
+        return np.zeros((0,), dtype=np.float64)
+
+    pts = np.asarray(points, dtype=np.float64)
+
+    if geometry_adaptive and n > k:
+        tree = KDTree(pts)
+        dists, _ = tree.query(pts, k=k + 1)
+        dists = dists[:, 1:]
+        mean_dists = dists.mean(axis=1)
+        sigmas = beta * mean_dists
+        # sigmas = np.clip(sigmas, min_sigma, max_sigma)
+    else:
+        sigmas = np.full(n, sigma, dtype=np.float64)
+
+    return sigmas
+
+
+# ---------------------------------------------------------
 # DOT HANDLER
 # ---------------------------------------------------------
 
@@ -67,24 +107,15 @@ def _density_from_points(
         return density
 
     pts = np.asarray(points, dtype=np.float64)
-
-    # -----------------------------------------------------
-    # Compute adaptive sigmas (kNN)
-    # -----------------------------------------------------
-    if geometry_adaptive and len(points) > k:
-        tree = KDTree(pts)
-
-        # k+1 because first neighbor is the point itself
-        dists, _ = tree.query(pts, k=k + 1)
-        dists = dists[:, 1:]  # remove self-distance
-
-        mean_dists = dists.mean(axis=1)
-
-        sigmas = beta * mean_dists
-        # sigmas = np.clip(sigmas, min_sigma, max_sigma)
-
-    else:
-        sigmas = np.full(len(points), sigma, dtype=np.float64)
+    sigmas = compute_dot_sigmas(
+        points,
+        sigma=sigma,
+        geometry_adaptive=geometry_adaptive,
+        k=k,
+        beta=beta,
+        min_sigma=min_sigma,
+        max_sigma=max_sigma,
+    )
     # -----------------------------------------------------
     # Place Gaussians (local patches)
     # -----------------------------------------------------
@@ -114,6 +145,74 @@ def _density_from_points(
         density[y1:y2, x1:x2] += g[gy1:gy2, gx1:gx2]
 
     return density
+
+
+def _csrnet_reference_sigma(
+    dist_row: np.ndarray,
+    n_points: int,
+    shape: Tuple[int, int],
+) -> float:
+    """
+    Per-head sigma from the official CSRNet-pytorch ``make_dataset.ipynb`` recipe:
+    ``sigma = (d1 + d2 + d3) * 0.1`` for three nearest neighbors (excluding self).
+    Single point: ``mean(H, W) / 4`` (same as ``average(shape) / 2 / 2`` in the notebook).
+    For fewer than three neighbors (tiny point sets), approximate with available distances.
+    """
+    if n_points <= 1:
+        return float(np.mean(shape) / 4.0)
+
+    nn = dist_row[1:]
+    if nn.size >= 3:
+        return float(0.1 * (float(nn[0]) + float(nn[1]) + float(nn[2])))
+    if nn.size == 2:
+        return float(0.1 * (float(nn[0]) + float(nn[1]) + float(nn[1])))
+    if nn.size == 1:
+        return float(0.3 * float(nn[0]))
+    return float(np.mean(shape) / 4.0)
+
+
+def density_from_points_csrnet_reference(
+    shape: Tuple[int, int],
+    points: List[Tuple[float, float]],
+    *,
+    kdtree_leafsize: int = 2048,
+) -> np.ndarray:
+    """
+    CSRNet reference preprocessing (``make_dataset.ipynb`` / CrowdNet-style):
+    for each head, place a unit impulse on the rounded pixel and accumulate
+    ``scipy.ndimage.gaussian_filter(impulse, sigma, mode='constant')``,
+    with adaptive ``sigma`` from k-NN distances (0.1 * sum of three NN distances).
+
+    This is **not** the same as :func:`_density_from_points` (discrete normalized patches).
+    """
+    print(f"in density_from_points_csrnet_reference")
+    H, W = shape
+    density = np.zeros((H, W), dtype=np.float32)
+    n = len(points)
+    if n == 0:
+        return density
+
+    pts = np.asarray(points, dtype=np.float64)
+    tree = KDTree(pts.copy(), leafsize=kdtree_leafsize)
+    k_query = min(4, n)
+    dists_all, _ = tree.query(pts, k=k_query)
+
+    for i in range(n):
+        x_int = int(round(float(pts[i, 0])))
+        y_int = int(round(float(pts[i, 1])))
+        if x_int < 0 or x_int >= W or y_int < 0 or y_int >= H:
+            continue
+
+        sigma = _csrnet_reference_sigma(dists_all[i], n, shape)
+        if sigma <= 0:
+            sigma = float(np.mean(shape) / 4.0)
+
+        impulse = np.zeros((H, W), dtype=np.float32)
+        impulse[y_int, x_int] = 1.0
+        density += gaussian_filter(impulse, sigma, mode="constant")
+
+    return density
+
 
 # ---------------------------------------------------------
 # BBOX HANDLER
@@ -188,7 +287,8 @@ def _density_from_segmentations(shape, masks, params, **kwargs):
 # ---------------------------------------------------------
 
 DENSITY_GENERATORS = {
-    AnnotationType.DOT: _density_from_points,
+    # AnnotationType.DOT: _density_from_points,
+    AnnotationType.DOT: density_from_points_csrnet_reference,
     AnnotationType.BBOX: _density_from_bboxes,
     AnnotationType.SEGMENTATION: _density_from_segmentations,
 }
@@ -248,4 +348,4 @@ def generate_density(
     except KeyError:
         raise ValueError(f"Unsupported annotation_type: {annotation_type}")
 
-    return handler(shape, annotations, **params)
+    return handler(shape, annotations)

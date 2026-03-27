@@ -99,7 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-name",
         type=str,
-        default="shng",
+        default="shng-A",
         help="Short identifier for the dataset (used in saved filenames).",
     )
     parser.add_argument(
@@ -132,8 +132,9 @@ def parse_args() -> argparse.Namespace:
         "--density-scale",
         type=float,
         default=DEFAULT_DENSITY_SCALE,
-        help="Training only: MSE target = raw_gt * scale; count from pred = pred.sum()/scale. "
-        "Must match when visualizing trained checkpoints.",
+        help="Training (UNet/ViT): MSE target uses this scale; count = pred.sum()/scale. "
+        "CSRNet ignores this and uses OpenCV cubic ×64 targets with scale 1. "
+        "Must match when visualizing a given checkpoint.",
     )
     parser.add_argument(
         "--freeze-encoder",
@@ -150,8 +151,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-6,
-        help="Learning rate.",
+        default=None,
+        help="Learning rate. Default: 1e-7 for CSRNet, 1e-6 for UNet/ViT (override anytime).",
     )
     parser.add_argument(
         "--momentum",
@@ -186,16 +187,18 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.lr is None:
+        args.lr = 1e-7 if args.model == "csrnet" else 1e-6
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    transform = compose_transforms(
-    #     # random_90deg_rotation_transform,
-    #     color_jitter_transform,
-        normalize_imagenet_transform,
-    )
+    # transform = compose_transforms(
+    # #     # random_90deg_rotation_transform,
+    #     # color_jitter_transform,
+    #     normalize_imagenet_transform,
+    # )
 
     dataset_kwargs = dict(
         root="/home/haneenn/.cache/kagglehub/datasets/tthien/shanghaitech/versions/1/ShanghaiTech",
-        part=["part_A"],
+        part=["part_B"],
         density_map_dir=DENSITY_MAP_DIR_AUTO,
         keep_original_image=False,
         density_geometry_adaptive=True,
@@ -231,13 +234,15 @@ if __name__ == "__main__":
         train_dataset = PatchAugmentedDataset(
             train_full_dataset,
             random_crops_per_image=5,
-            mirror=True,
-            seed=42,
+            mirror=False,
+            # seed=42,
+        #     transform=transform,
         )
         val_dataset = load_shanghaitech_dataset(
             **dataset_kwargs,
             split="test_data",
             mask_object_ratio=None,
+            # transform=transform,
         )
 
     print(f"Train: {len(train_dataset)} samples, Val: {len(val_dataset)} samples")
@@ -257,10 +262,7 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Unknown model {args.model!r}")
 
-    train(
-        model,
-        train_dataset,
-        val_dataset,
+    train_kw = dict(
         epochs=args.epochs,
         count_loss_weight=args.count_loss_weight,
         model_name=args.model,
@@ -270,6 +272,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         early_stopping_patience=args.early_stopping_patience,
         density_scale=args.density_scale,
+        gt_downsample="bilinear",
         batch_size=1,
         validate_during_training=not args.no_validation,
         optimizer_type=args.optimizer,
@@ -277,6 +280,11 @@ if __name__ == "__main__":
         momentum=args.momentum,
         weight_decay=args.weight_decay,
     )
+    if args.model == "csrnet":
+        train_kw["gt_downsample"] = "csrnet_cubic"
+        train_kw["density_scale"] = 1.0
+
+    train(model, train_dataset, val_dataset, **train_kw)
 
    
     

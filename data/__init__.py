@@ -4,12 +4,13 @@ Supports dotted, bbox, and segmentation annotations.
 """
 
 from .annotation_types import AnnotationType
-from .density import generate_density
+from .density import density_from_points_csrnet_reference, generate_density
 from .masking import generate_instance_mask
 from .dataset import (
     PatchAugmentedDataset,
     ObjectCountingDataset,
     visualize_csrnet_patch_augmented_dataset,
+    visualize_density_discrete_vs_csrnet_reference,
 )
 from .shanghaitech import (
     build_shanghaitech_samples,
@@ -25,6 +26,7 @@ from .fsc147 import (
 __all__ = [
     "AnnotationType",
     "generate_density",
+    "density_from_points_csrnet_reference",
     "generate_instance_mask",
     "PatchAugmentedDataset",
     "ObjectCountingDataset",

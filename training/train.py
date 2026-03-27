@@ -2,16 +2,26 @@
 Minimal training script for density map regression (object counting)
 with logging and training curves.
 
-Dataset yields raw density (sum ≈ count). Training uses density_scale only here:
-  - MSE target = raw_gt * density_scale (stronger gradients)
-  - pred_count = pred.sum() / density_scale, gt_count = raw_gt.sum()
+Dataset yields raw density (sum ≈ count).
+
+Two GT supervision modes when pred is lower-res than GT (e.g. CSRNet 1/8):
+
+- ``bilinear`` (default for non-CSRNet): ``F.interpolate`` + area factor, then
+  ``* density_scale`` (e.g. 255). Count: ``pred.sum() / density_scale``.
+
+- ``csrnet_cubic`` (CSRNet-pytorch ``image.py``): ``cv2.resize(..., INTER_CUBIC)``
+  to pred size, then ``* 64`` to preserve count. Use ``density_scale=1``.
+  Count: ``pred.sum()``.
 """
 
 import json
 import random
 from pathlib import Path
+from typing import Sequence
 
+import cv2
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import BatchSampler, DataLoader
@@ -24,6 +34,32 @@ from data.dataset import visualize_image_and_density
 # Default training scale (only applied in this module, not in dataset).
 DEFAULT_DENSITY_SCALE = 255.0
 
+# CSRNet reference: downscale GT by 8×8 → multiply by 64 to keep integral (see CSRNet-pytorch image.py).
+CSRNET_GT_DOWNSAMPLE_FACTOR_SQ = 64.0
+
+
+def downsample_gt_csrnet_cubic(
+    gt_density: torch.Tensor,
+    out_h: int,
+    out_w: int,
+) -> torch.Tensor:
+    """
+    Match CSRNet-pytorch: cv2.resize to (out_w, out_h), INTER_CUBIC, × 64.
+
+    ``gt_density``: (N, 1, H, W) or (N, C, H, W) with C==1.
+    """
+    if gt_density.shape[1] != 1:
+        raise ValueError("csrnet_cubic downsample expects a single-channel density (N,1,H,W).")
+    device = gt_density.device
+    dtype = gt_density.dtype
+    x = gt_density.detach().float().cpu().numpy()
+    n = x.shape[0]
+    out = np.empty((n, 1, out_h, out_w), dtype=np.float32)
+    for i in range(n):
+        plane = x[i, 0]
+        resized = cv2.resize(plane, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
+        out[i, 0] = resized.astype(np.float32) * CSRNET_GT_DOWNSAMPLE_FACTOR_SQ
+    return torch.from_numpy(out).to(device=device, dtype=dtype)
 
 class PatchBatchSampler(BatchSampler):
     """
@@ -60,30 +96,45 @@ def compute_loss(
     count_loss_weight: float = 1.0,
     loss_mode: str = "density_mse_count_l1",
     density_scale: float = DEFAULT_DENSITY_SCALE,
+    gt_downsample: str = "bilinear",
 ):
     """
     gt_density: raw from dataloader (integral ≈ count).
-    Network is trained to match gt_density * density_scale.
+    ``gt_downsample``: ``bilinear`` (area-correct + ``* density_scale``) or
+    ``csrnet_cubic`` (OpenCV cubic + ×64, use ``density_scale=1``).
     """
-    # CSRNet-style: downsample raw GT, preserve integral
-    if pred_density.shape[-2:] != gt_density.shape[-2:]:
-        H_gt, W_gt = gt_density.shape[-2:]
-        H_pred, W_pred = pred_density.shape[-2:]
-        gt_density = F.interpolate(
-            gt_density,
-            size=(H_pred, W_pred),
-            mode="bilinear",
-            align_corners=False,
-        )
-        scale_h = H_gt / H_pred
-        scale_w = W_gt / W_pred
-        gt_density = gt_density * (scale_h * scale_w)
+    if gt_downsample not in ("bilinear", "csrnet_cubic"):
+        raise ValueError(f"gt_downsample must be 'bilinear' or 'csrnet_cubic', got {gt_downsample!r}")
 
-    gt_target = gt_density * density_scale
+    H_pred, W_pred = pred_density.shape[-2:]
+    gt_for_count = gt_density
+    if pred_density.shape[-2:] != gt_density.shape[-2:]:
+        if gt_downsample == "csrnet_cubic":
+            gt_resized = downsample_gt_csrnet_cubic(gt_density, H_pred, W_pred)
+            gt_for_count = gt_resized
+            gt_target = gt_resized
+        else:
+            H_gt, W_gt = gt_density.shape[-2:]
+            gt_resized = F.interpolate(
+                gt_density,
+                size=(H_pred, W_pred),
+                mode="bilinear",
+                align_corners=False,
+            )
+            scale_h = H_gt / H_pred
+            scale_w = W_gt / W_pred
+            gt_resized = gt_resized * (scale_h * scale_w)
+            gt_for_count = gt_resized
+            gt_target = gt_resized * density_scale
+    else:
+        gt_for_count = gt_density
+        gt_target = gt_density * density_scale
+
     density_loss = F.mse_loss(pred_density, gt_target)
+    # density_loss = F.mse_loss(pred_density, gt_target, reduction="sum")
 
     pred_count = pred_density.sum(dim=(1, 2, 3)) / density_scale
-    gt_count = gt_density.sum(dim=(1, 2, 3))
+    gt_count = gt_for_count.sum(dim=(1, 2, 3))
 
     if loss_mode == "density_mse_count_mse":
         count_loss = F.mse_loss(pred_count, gt_count)
@@ -96,20 +147,33 @@ def compute_loss(
 # -----------------------------
 # Count helpers
 # -----------------------------
-def _counts_from_densities(pred_density, gt_density, density_scale):
+def _counts_from_densities(
+    pred_density,
+    gt_density,
+    density_scale: float,
+    gt_downsample: str = "bilinear",
+):
     """
     Derive predicted and GT counts, handling the resolution mismatch
     between CSRNet-style 1/8-res predictions and full-res GT.
     """
+    if gt_downsample not in ("bilinear", "csrnet_cubic"):
+        raise ValueError(f"gt_downsample must be 'bilinear' or 'csrnet_cubic', got {gt_downsample!r}")
+
     if pred_density.shape[-2:] != gt_density.shape[-2:]:
-        H_gt, W_gt = gt_density.shape[-2:]
         H_pred, W_pred = pred_density.shape[-2:]
-        gt_down = F.interpolate(
-            gt_density, size=(H_pred, W_pred),
-            mode="bilinear", align_corners=False,
-        )
-        spatial_scale = (H_gt / H_pred) * (W_gt / W_pred)
-        gt_down = gt_down * spatial_scale
+        if gt_downsample == "csrnet_cubic":
+            gt_down = downsample_gt_csrnet_cubic(gt_density, H_pred, W_pred)
+        else:
+            H_gt, W_gt = gt_density.shape[-2:]
+            gt_down = F.interpolate(
+                gt_density,
+                size=(H_pred, W_pred),
+                mode="bilinear",
+                align_corners=False,
+            )
+            spatial_scale = (H_gt / H_pred) * (W_gt / W_pred)
+            gt_down = gt_down * spatial_scale
         gt_count = gt_down.sum(dim=(1, 2, 3))
     else:
         gt_count = gt_density.sum(dim=(1, 2, 3))
@@ -129,6 +193,7 @@ def train_one_epoch(
     count_loss_weight: float = 1.0,
     loss_mode: str = "density_mse_count_l1",
     density_scale: float = DEFAULT_DENSITY_SCALE,
+    gt_downsample: str = "bilinear",
 ):
 
     model.train()
@@ -152,10 +217,11 @@ def train_one_epoch(
             count_loss_weight=count_loss_weight,
             loss_mode=loss_mode,
             density_scale=density_scale,
+            gt_downsample=gt_downsample,
         )
         with torch.no_grad():
             pred_count, gt_count = _counts_from_densities(
-                pred_density, gt_density, density_scale
+                pred_density, gt_density, density_scale, gt_downsample=gt_downsample
             )
         mae = torch.abs(pred_count - gt_count).sum()
 
@@ -164,7 +230,8 @@ def train_one_epoch(
 
         batch_size = images.size(0)
 
-        total_loss += loss.item() * batch_size
+        # total_loss += loss.item() * batch_size
+        total_loss += loss.item()
 
 
         total_mae += mae.item()
@@ -180,7 +247,13 @@ def train_one_epoch(
 # Validation
 # -----------------------------
 @torch.no_grad()
-def validate(model, dataloader, device, density_scale: float = DEFAULT_DENSITY_SCALE):
+def validate(
+    model,
+    dataloader,
+    device,
+    density_scale: float = DEFAULT_DENSITY_SCALE,
+    gt_downsample: str = "bilinear",
+):
 
     model.eval()
 
@@ -195,7 +268,7 @@ def validate(model, dataloader, device, density_scale: float = DEFAULT_DENSITY_S
         pred_density = model(images)
 
         pred_count, gt_count = _counts_from_densities(
-            pred_density, gt_density, density_scale
+            pred_density, gt_density, density_scale, gt_downsample=gt_downsample
         )
         mae = torch.abs(pred_count - gt_count).sum()
 
@@ -247,6 +320,7 @@ def train(
     mask_mode: str | None = None,
     output_dir: str | Path = "trained_models",
     density_scale: float = DEFAULT_DENSITY_SCALE,
+    gt_downsample: str = "bilinear",
     validate_during_training: bool = True,
     optimizer_type: str = "sgd",
     lr: float = 1e-7,
@@ -261,13 +335,14 @@ def train(
         device,
         f"with {epochs} epochs, batch size: {batch_size}, loss mode: {loss_mode}, "
         f"count loss weight: {count_loss_weight}, density scale: {density_scale}, "
+        f"gt_downsample: {gt_downsample}, "
         f"mask ratio: {mask_ratio}, mask mode: {mask_mode}, "
         f"optimizer: {optimizer_type}, lr: {lr}"
     )
 
     model = model.to(device)
 
-    if isinstance(train_dataset, PatchAugmentedDataset):
+    if False and isinstance(train_dataset, PatchAugmentedDataset):
         effective_batch_size = train_dataset.variants_per_image
         print(
             "Detected CSRNetPatchAugmentedDataset for training. "
@@ -310,21 +385,24 @@ def train(
 
     if optimizer_type == "sgd":
         optimizer = torch.optim.SGD(
-            model.parameters(), lr=lr,
-            momentum=momentum, weight_decay=weight_decay,
+            model.parameters(),
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
         )
     else:
         optimizer = torch.optim.Adam(
             model.parameters(), lr=lr, weight_decay=weight_decay,
         )
-    output_dir = Path(output_dir) / model_name
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     if mask_ratio is None:
         mask_str = "nomsk"
     else:
         mask_str = f"{mask_ratio}-{mask_mode or 'inpaint'}"
     run_name = f"{model_name}-{data_name}-{mask_str}"
+    
+    output_dir = Path(output_dir) / model_name / run_name
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     best_mae = float("inf")
     epochs_without_improvement = 0
@@ -355,6 +433,7 @@ def train(
             count_loss_weight=count_loss_weight,
             loss_mode=loss_mode,
             density_scale=density_scale,
+            gt_downsample=gt_downsample,
         )
         
         val_mae = None
@@ -364,6 +443,7 @@ def train(
                 val_loader,
                 device,
                 density_scale=density_scale,
+                gt_downsample=gt_downsample,
             )
 
         current_lr = optimizer.param_groups[0]["lr"]
@@ -403,10 +483,10 @@ def train(
 
                 visualize_image_and_density(
                     _vis_base_ds,
-                    _vis_base_ds.samples[_vis_first_idx]["image_path"],
+                    index=_vis_first_idx,
                     use_precomputed_density=True,
                     pred_density_scale=density_scale,
-                    save_path=output_dir / f"{run_name}-val-visu.png",
+                    save_dir=output_dir,
                     model=model,
                 )
             else:

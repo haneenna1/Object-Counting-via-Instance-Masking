@@ -137,8 +137,8 @@ class ShanghaiTechDataset(ObjectCountingDataset):
         split: str = "train_data",
         *,
         density_sigma: float = 4.0,
-        mask_dot_box_size: int | None = 32,
-        mask_object_ratio: float | None = 0.5,
+        mask_dot_box_size: int | None = None,
+        mask_object_ratio: float | None = None,
         **kwargs: Any,
     ) -> None:
         root_path = Path(root)
@@ -159,8 +159,8 @@ def load_shanghaitech_dataset(
     split: str = "train_data",
     *,
     density_sigma: float = 4.0,
-    mask_dot_box_size: int | None = 32,
-    mask_object_ratio: float | None = 0.5,
+    mask_dot_box_size: int | None = None,
+    mask_object_ratio: float | None = None,
     **kwargs: Any,
 ) -> ObjectCountingDataset:
     """
@@ -171,7 +171,8 @@ def load_shanghaitech_dataset(
         part: 'part_A_final' or 'part_B_final'.
         split: 'train_data' or 'test_data'.
         density_sigma: Gaussian sigma for dot density generation.
-        mask_dot_box_size: Box size (pixels) for masking around each dot.
+        mask_dot_box_size: Fixed box side length (pixels) per dot, or None for
+            sigma-based size (``mask_dot_sigma_to_box * sigma``; geometry-adaptive when enabled).
         mask_object_ratio: Fraction of objects to mask per image (0..1), or None for no masking.
         **kwargs: Passed through to ObjectCountingDataset (e.g. transform).
 
