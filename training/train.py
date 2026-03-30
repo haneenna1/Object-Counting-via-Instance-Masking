@@ -28,6 +28,8 @@ import torch.nn.functional as F
 from torch.utils.data import BatchSampler, DataLoader
 from tqdm import tqdm
 
+from torch.optim.lr_scheduler import SequentialLR, CosineAnnealingLR
+
 from data.dataset import PatchAugmentedDataset
 from data.dataset import visualize_image_and_density
 
@@ -66,25 +68,53 @@ def _param_skips_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
 
 def build_optimizer_param_groups(
     module: torch.nn.Module,
-    lr: float,
+    dec_lr: float,
+    backbone_lr: float,
     weight_decay: float,
 ) -> list[dict]:
-    """Trainable parameters split into AdamW/SGD groups (decay vs no decay)."""
-    decay: list[torch.nn.Parameter] = []
-    no_decay: list[torch.nn.Parameter] = []
-    for name, param in module.named_parameters():
+    """Build decoder/encoder decay groups, with encoder LR initialized to 0."""
+    if not hasattr(module, "encoder"):
+        raise RuntimeError("Model has no `encoder` module.")
+    if not hasattr(module, "decoder"):
+        raise RuntimeError("Model has no `decoder` module.")
+
+    dec_decay: list[torch.nn.Parameter] = []
+    dec_no_decay: list[torch.nn.Parameter] = []
+    enc_decay: list[torch.nn.Parameter] = []
+    enc_no_decay: list[torch.nn.Parameter] = []
+
+    for name, param in module.decoder.named_parameters():
         if not param.requires_grad:
             continue
         if _param_skips_weight_decay(name, param):
-            print(f"skipping weight decay for {name}")
-            no_decay.append(param)
+            dec_no_decay.append(param)
         else:
-            decay.append(param)
+            dec_decay.append(param)
+
+    for name, param in module.encoder.named_parameters():
+        if _param_skips_weight_decay(name, param):
+            enc_no_decay.append(param)
+        else:
+            enc_decay.append(param)
+
     groups: list[dict] = []
-    if no_decay:
-        groups.append({"params": no_decay, "lr": lr, "weight_decay": 0.0})
-    if decay:
-        groups.append({"params": decay, "lr": lr, "weight_decay": weight_decay})
+    if dec_no_decay:
+        groups.append(
+            {"params": dec_no_decay, "lr": dec_lr, "weight_decay": 0.0, "group_name": "decoder_no_decay"}
+        )
+    if dec_decay:
+        groups.append(
+            {"params": dec_decay, "lr": dec_lr, "weight_decay": weight_decay, "group_name": "decoder_decay"}
+        )
+    if enc_no_decay:
+        groups.append(
+            {"params": enc_no_decay, "lr": backbone_lr, "weight_decay": 0.0, "group_name": "encoder_no_decay"}
+        )
+    if enc_decay:
+        groups.append(
+            {"params": enc_decay, "lr": backbone_lr, "weight_decay": weight_decay, "group_name": "encoder_decay"}
+        )
+
     if not groups:
         raise RuntimeError("No trainable parameters in module for optimizer groups.")
     return groups
@@ -357,13 +387,10 @@ def plot_training_curves(history, save_path: str | Path):
     plt.close()
 
 
-
 # ---------------------------------------------------------
 
 # Main training function
-
 # -----------------------------
-
 def train(
     model,
     train_dataset,
@@ -457,12 +484,26 @@ def train(
     if not any(p.requires_grad for p in model.parameters()):
         raise RuntimeError("No trainable parameters (check freeze_encoder / masking).")
     
-    param_groups = build_optimizer_param_groups(model, lr, weight_decay)
+    backbone_lr = lr * 0.1
+    param_groups = build_optimizer_param_groups(model, lr, backbone_lr, weight_decay)
 
     if optimizer_type == "sgd":
         optimizer = torch.optim.SGD(param_groups, lr=lr, momentum=momentum)
     else:
         optimizer = torch.optim.AdamW(param_groups, lr=lr)
+
+    # warmup_epochs = 5
+    warmup_epochs=unfreeze_backbone_after_epoch if unfreeze_backbone_after_epoch is not None else 5
+
+    scheduler_warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
+    scheduler_cosine = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=1e-7)
+
+    lr_scheduler = SequentialLR(
+        optimizer, 
+        schedulers=[scheduler_warmup, scheduler_cosine], 
+        milestones=[warmup_epochs]
+    )
+
 
     if mask_ratio is None:
         mask_str = "nomsk"
@@ -506,17 +547,8 @@ def train(
                 p.requires_grad = True
 
             if n_frozen > 0:
-                backbone_lr = lr * 0.1
-                enc_groups = build_optimizer_param_groups(enc, backbone_lr, weight_decay)
-
-                for g in enc_groups:
-                    optimizer.add_param_group(g)
-
-                n_enc_tensors = sum(len(g["params"]) for g in enc_groups)
-
                 print(
                     f"Epoch {epoch:03d} | Unfrozen backbone (`encoder`); "
-                    f"added {len(enc_groups)} optimizer param group(s), {n_enc_tensors} tensors "
                     f"(backbone lr={backbone_lr:.2e})."
                 )
             else:
@@ -537,6 +569,9 @@ def train(
             gt_downsample=gt_downsample,
             max_grad_norm=max_grad_norm,
         )
+
+        # Step the scheduler to update the LR
+        lr_scheduler.step()
         
         val_mae = None
         if validate_during_training:
