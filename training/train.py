@@ -6,8 +6,9 @@ Dataset yields raw density (sum ≈ count).
 
 Two GT supervision modes when pred is lower-res than GT (e.g. CSRNet 1/8):
 
-- ``bilinear`` (default for non-CSRNet): ``F.interpolate`` + area factor, then
-  ``* density_scale`` (e.g. 255). Count: ``pred.sum() / density_scale``.
+- ``bilinear`` (default for non-CSRNet): MSE on **raw** pred vs **raw** (resized, area-corrected)
+  GT; ``density_loss = density_scale * MSE(pred, gt)`` so gradients are scaled up. Count:
+  ``pred.sum()`` (same units as GT).
 
 - ``csrnet_cubic`` (CSRNet-pytorch ``image.py``): ``cv2.resize(..., INTER_CUBIC)``
   to pred size, then ``* 64`` to preserve count. Use ``density_scale=1``.
@@ -36,6 +37,57 @@ DEFAULT_DENSITY_SCALE = 255.0
 
 # CSRNet reference: downscale GT by 8×8 → multiply by 64 to keep integral (see CSRNet-pytorch image.py).
 CSRNET_GT_DOWNSAMPLE_FACTOR_SQ = 64.0
+
+
+def _param_skips_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
+    """ViT / transformer-style: no decay on bias, norm, and token/position embeddings."""
+    if param.ndim <= 1:
+        return True
+    n = name.lower()
+    if any(
+        t in n
+        for t in (
+            "pos_embed",
+            "cls_token",
+            "dist_token",
+            "mask_token",
+            "register_tokens",
+            "prompt",
+            "rel_pos",
+            "relative_position_bias_table",
+            "absolute_pos_embed",
+        )
+    ):
+        return True
+    if "norm" in n:
+        return True
+    return False
+
+
+def build_optimizer_param_groups(
+    module: torch.nn.Module,
+    lr: float,
+    weight_decay: float,
+) -> list[dict]:
+    """Trainable parameters split into AdamW/SGD groups (decay vs no decay)."""
+    decay: list[torch.nn.Parameter] = []
+    no_decay: list[torch.nn.Parameter] = []
+    for name, param in module.named_parameters():
+        if not param.requires_grad:
+            continue
+        if _param_skips_weight_decay(name, param):
+            print(f"skipping weight decay for {name}")
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    groups: list[dict] = []
+    if no_decay:
+        groups.append({"params": no_decay, "lr": lr, "weight_decay": 0.0})
+    if decay:
+        groups.append({"params": decay, "lr": lr, "weight_decay": weight_decay})
+    if not groups:
+        raise RuntimeError("No trainable parameters in module for optimizer groups.")
+    return groups
 
 
 def downsample_gt_csrnet_cubic(
@@ -194,6 +246,7 @@ def train_one_epoch(
     loss_mode: str = "density_mse_count_l1",
     density_scale: float = DEFAULT_DENSITY_SCALE,
     gt_downsample: str = "bilinear",
+    max_grad_norm: float | None = 1.0,
 ):
 
     model.train()
@@ -226,6 +279,8 @@ def train_one_epoch(
         mae = torch.abs(pred_count - gt_count).sum()
 
         loss.backward()
+        if max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
 
         batch_size = images.size(0)
@@ -302,9 +357,13 @@ def plot_training_curves(history, save_path: str | Path):
     plt.close()
 
 
+
 # ---------------------------------------------------------
+
 # Main training function
+
 # -----------------------------
+
 def train(
     model,
     train_dataset,
@@ -326,6 +385,8 @@ def train(
     lr: float = 1e-7,
     momentum: float = 0.95,
     weight_decay: float = 5e-4,
+    unfreeze_backbone_after_epoch: int | None = None,
+    max_grad_norm: float | None = 1.0,
 ):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -339,6 +400,18 @@ def train(
         f"mask ratio: {mask_ratio}, mask mode: {mask_mode}, "
         f"optimizer: {optimizer_type}, lr: {lr}"
     )
+
+    if unfreeze_backbone_after_epoch is not None:
+        if not hasattr(model, "encoder"):
+            print("Warning: unfreeze_backbone_after_epoch is set but model has no "
+            "`encoder`; scheduled unfreeze will be skipped."
+            )
+        else:
+            print( f"Backbone (`encoder`) will be unfrozen starting at epoch "
+                    f"{unfreeze_backbone_after_epoch + 1} "
+                    f"(after completing epoch {unfreeze_backbone_after_epoch})"
+                    f"."
+            )
 
     model = model.to(device)
 
@@ -379,21 +452,17 @@ def train(
             pin_memory=True,
         )
     elif early_stopping_patience is not None:
-        print(
-            "Validation disabled: early stopping requires validation MAE and will be ignored."
-        )
+        print("Validation disabled: early stopping requires validation MAE and will be ignored.")
+
+    if not any(p.requires_grad for p in model.parameters()):
+        raise RuntimeError("No trainable parameters (check freeze_encoder / masking).")
+    
+    param_groups = build_optimizer_param_groups(model, lr, weight_decay)
 
     if optimizer_type == "sgd":
-        optimizer = torch.optim.SGD(
-            model.parameters(),
-            lr=lr,
-            momentum=momentum,
-            weight_decay=weight_decay,
-        )
+        optimizer = torch.optim.SGD(param_groups, lr=lr, momentum=momentum)
     else:
-        optimizer = torch.optim.Adam(
-            model.parameters(), lr=lr, weight_decay=weight_decay,
-        )
+        optimizer = torch.optim.AdamW(param_groups, lr=lr)
 
     if mask_ratio is None:
         mask_str = "nomsk"
@@ -423,7 +492,39 @@ def train(
             _vis_base_ds = _vds
             _vis_first_idx = 0
 
+    backbone_unfreeze_done = False
+
     for epoch in range(1, epochs + 1):
+        if(not backbone_unfreeze_done
+            and unfreeze_backbone_after_epoch is not None
+            and hasattr(model, "encoder")
+            and epoch > unfreeze_backbone_after_epoch
+        ):
+            enc = model.encoder
+            n_frozen = sum(1 for p in enc.parameters() if not p.requires_grad)
+            for p in enc.parameters():
+                p.requires_grad = True
+
+            if n_frozen > 0:
+                backbone_lr = lr * 0.1
+                enc_groups = build_optimizer_param_groups(enc, backbone_lr, weight_decay)
+
+                for g in enc_groups:
+                    optimizer.add_param_group(g)
+
+                n_enc_tensors = sum(len(g["params"]) for g in enc_groups)
+
+                print(
+                    f"Epoch {epoch:03d} | Unfrozen backbone (`encoder`); "
+                    f"added {len(enc_groups)} optimizer param group(s), {n_enc_tensors} tensors "
+                    f"(backbone lr={backbone_lr:.2e})."
+                )
+            else:
+                print(
+                f"Epoch {epoch:03d} | Backbone unfreeze skipped: "
+                f"encoder was already trainable."
+            )
+            backbone_unfreeze_done = True
 
         train_loss, train_mae = train_one_epoch(
             model,
@@ -434,6 +535,7 @@ def train(
             loss_mode=loss_mode,
             density_scale=density_scale,
             gt_downsample=gt_downsample,
+            max_grad_norm=max_grad_norm,
         )
         
         val_mae = None
@@ -446,7 +548,15 @@ def train(
                 gt_downsample=gt_downsample,
             )
 
-        current_lr = optimizer.param_groups[0]["lr"]
+        uniq_lrs = sorted({g["lr"] for g in optimizer.param_groups}, reverse=True)
+        current_lr = uniq_lrs[0] if len(uniq_lrs) == 1 else uniq_lrs
+        lr_str = (
+            f"{current_lr:.2e}"
+            if not isinstance(current_lr, list)
+            else "/".join(f"{x:.2e}" for x in current_lr)
+        )
+
+
 
         history["train_loss"].append(train_loss)
         history["train_mae"].append(train_mae)
@@ -467,7 +577,7 @@ def train(
         if val_mae is not None:
             print(
                 f"Epoch {epoch:03d} | "
-                f"lr {current_lr:.2e} | "
+                f"lr {lr_str} | "
                 f"total loss {train_loss:.4f} | "
                 f"Train MAE {train_mae:.2f} | "
                 f"Val MAE {val_mae:.2f} | "
@@ -504,7 +614,7 @@ def train(
         else:
             print(
                 f"Epoch {epoch:03d} | "
-                f"lr {current_lr:.2e} | "
+                f"lr {lr_str} | "
                 f"total loss {train_loss:.4f} | "
                 f"Train MAE {train_mae:.2f}"
             )

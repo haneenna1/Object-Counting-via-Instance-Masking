@@ -185,7 +185,6 @@ def density_from_points_csrnet_reference(
 
     This is **not** the same as :func:`_density_from_points` (discrete normalized patches).
     """
-    print(f"in density_from_points_csrnet_reference")
     H, W = shape
     density = np.zeros((H, W), dtype=np.float32)
     n = len(points)
@@ -218,9 +217,9 @@ def density_from_points_csrnet_reference(
 # BBOX HANDLER
 # ---------------------------------------------------------
 
-def _density_from_bboxes(shape, bboxes, params, **kwargs):
+def _density_from_bboxes(shape, bboxes, sigma_scale_bbox=0.25, **kwargs):
 
-    sigma_scale = params["sigma_scale_bbox"]
+    sigma_scale = sigma_scale_bbox
 
     H, W = shape
     density = np.zeros((H, W), dtype=np.float64)
@@ -245,10 +244,10 @@ def _density_from_bboxes(shape, bboxes, params, **kwargs):
 # SEGMENTATION HANDLER
 # ---------------------------------------------------------
 
-def _density_from_segmentations(shape, masks, params, **kwargs):
+def _density_from_segmentations(shape, masks, sigma_from_seg_area=True, fixed_sigma_seg=4.0, **kwargs):
 
-    sigma_from_area = params["sigma_from_seg_area"]
-    fixed_sigma = params["fixed_sigma_seg"]
+    sigma_from_area = sigma_from_seg_area
+    fixed_sigma = fixed_sigma_seg
 
     H, W = shape
     density = np.zeros((H, W), dtype=np.float64)
@@ -348,4 +347,4 @@ def generate_density(
     except KeyError:
         raise ValueError(f"Unsupported annotation_type: {annotation_type}")
 
-    return handler(shape, annotations)
+    return handler(shape, annotations, **params)

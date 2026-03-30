@@ -157,7 +157,7 @@ class FSC147Dataset(ObjectCountingDataset):
         split: str = "train",
         *,
         density_sigma: float = 4.0,
-        mask_dot_box_size: int | None = 32,
+        mask_dot_box_size: int | None = None,
         mask_object_ratio: float | None = 0.5,
         **kwargs: Any,
     ) -> None:
@@ -182,7 +182,7 @@ def load_fsc147_dataset(
     split: str = "train",
     *,
     density_sigma: float = 4.0,
-    mask_dot_box_size: int | None = 32,
+    mask_dot_box_size: int | None = None,
     mask_object_ratio: float | None = 0.5,
     **kwargs: Any,
 ) -> ObjectCountingDataset:
@@ -193,7 +193,8 @@ def load_fsc147_dataset(
         root: Path to FSC147 root (the `data/FSC147` directory).
         split: One of "train", "val", or "test".
         density_sigma: Gaussian sigma for dot density generation.
-        mask_dot_box_size: Box size (pixels) for masking around each dot.
+        mask_dot_box_size: Fixed box side length (pixels) per dot, or None for
+            sigma-based size (see ObjectCountingDataset / masking).
         mask_object_ratio: Fraction of objects to mask per image (0..1), or
             None for no masking.
         **kwargs: Passed through to ObjectCountingDataset (e.g. transform).

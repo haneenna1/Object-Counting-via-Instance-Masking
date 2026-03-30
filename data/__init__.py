@@ -10,7 +10,6 @@ from .dataset import (
     PatchAugmentedDataset,
     ObjectCountingDataset,
     visualize_csrnet_patch_augmented_dataset,
-    visualize_density_discrete_vs_csrnet_reference,
 )
 from .shanghaitech import (
     build_shanghaitech_samples,

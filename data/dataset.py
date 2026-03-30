@@ -25,6 +25,21 @@ from .transforms import crop_sample, horizontal_flip_transform
 # Sentinel: use per-image default location <image_path>/../density_maps/<stem>_density.npy
 DENSITY_MAP_DIR_AUTO = "auto"
 
+
+def _density_stats_text(arr: np.ndarray) -> str:
+    """Multi-line summary for density panels (integral, spread, scale)."""
+    a = np.asarray(arr, dtype=np.float64).ravel()
+    if a.size == 0:
+        return "(empty)"
+    return (
+        f"Σ (integral) = {float(a.sum()):.6g}\n"
+        f"min = {float(a.min()):.6g}\n"
+        f"max = {float(a.max()):.6g}\n"
+        f"mean = {float(a.mean()):.6g}\n"
+        f"std = {float(a.std()):.6g}"
+    )
+
+
 # Ground-truth density maps are unscaled here: integral ≈ object count.
 # Apply training-time scaling only in training/train.py (density_scale) for targets and pred→count.
 
@@ -610,8 +625,9 @@ def visualize_image_and_density(
     use_dataset_item: when True (default), call ``dataset[sample_idx]`` so the mask, masked image, and
       target density match the dataloader exactly (including random subsampling of instances).
       Set False only if you want an independent mask/density pass (e.g. legacy comparisons).
-      Requires that file image shape matches ``batch["image"]`` (no random crop / resize in ``transform``),
-      otherwise raises.
+      If ``transform`` resizes (e.g. ViT 224×224), the first panel still shows the on-disk image at native
+      resolution; masked image, GT density, and model input use the transformed spatial size. Normalized
+      images (e.g. timm mean/std 0.5) are denormalized for display on the masked panel only.
     adaptive: when use_dataset_item=False, passed to generate_density for the GT map; when True and
       use_dataset_item=True, the figure subtitle still reflects dataset.density_geometry_adaptive.
     model: optional torch.nn.Module. When provided, the model is evaluated on the image and its
@@ -690,12 +706,6 @@ def visualize_image_and_density(
     if use_dataset_item:
         batch = dataset[sample_idx]
         masked_image = batch["image"]
-        if raw_image.shape != masked_image.shape:
-            raise ValueError(
-                "use_dataset_item=True but the tensor from dataset[...] has a different shape than the "
-                "image file. This usually means ``transform`` includes spatial augmentation (crop/resize). "
-                "Use a dataset without those transforms for this figure, or pass use_dataset_item=False."
-            )
         density = batch["density"].squeeze(0).detach().cpu().numpy().astype(np.float32)
         count = float(batch["count"].item())
         infer_image = batch["image"]
@@ -768,7 +778,8 @@ def visualize_image_and_density(
                 pred = pred.squeeze(0)
             if pred.ndim == 3 and pred.shape[0] == 1:
                 pred = pred.squeeze(0)
-            pred_count = float(pred.sum().item() / pred_density_scale)
+            scale = float(pred_density_scale)
+            pred_count = float(pred.sum().item() / scale)
 
             pred_h, pred_w = pred.shape[-2], pred.shape[-1]
             H_gt, W_gt = density.shape[:2]
@@ -783,33 +794,51 @@ def visualize_image_and_density(
                 density = density_t.squeeze().numpy()
                 # print(f"gt density interpolated from {H_gt}x{W_gt} to {pred_h}x{pred_w}: {density.shape}")
                 count = float(density.sum())
-            pred_arr = pred.squeeze().numpy()
+            # Same units as GT panel (raw density, integral ≈ count); model output is in training scale.
+            pred_arr = (pred.squeeze().float() / scale).numpy()
 
     has_dots = ann_type == AnnotationType.DOT and annotations
 
-    # Layout: Image | Masked image | [Dots] | GT density | [Pred]
+    # Layout: row0 = Image | Masked image | [Dots] | GT density | [Pred]
+    #         row1 = empty … | numeric stats under each density map
     ncols = 3 + (1 if has_dots else 0) + (1 if pred_arr is not None else 0)
     wscale = max(1.0, ncols / 2.0)
-    fig, axes = plt.subplots(1, ncols, figsize=(figsize[0] * wscale, figsize[1]))
-    axes_flat = np.atleast_1d(axes)
-    ax_im = axes_flat[0]
-    ax_masked = axes_flat[1]
+    fig, axes = plt.subplots(
+        2,
+        ncols,
+        figsize=(figsize[0] * wscale, figsize[1] * 1.45),
+        gridspec_kw={"height_ratios": [5.0, 1.25], "hspace": 0.28},
+        squeeze=False,
+    )
+    row0 = axes[0]
+    row1 = axes[1]
+    ax_im = row0[0]
+    ax_masked = row0[1]
     idx = 2
     if has_dots:
-        ax_dots = axes_flat[idx]
+        ax_dots = row0[idx]
         idx += 1
     else:
         ax_dots = None  # type: ignore[assignment]
-    ax_den = axes_flat[idx]
+    ax_den = row0[idx]
+    gt_col = idx
     idx += 1
     if pred_arr is not None:
-        ax_pred = axes_flat[idx]
+        ax_pred = row0[idx]
+        pred_col = idx
     else:
         ax_pred = None  # type: ignore[assignment]
+        pred_col = None
 
     img_cpu = raw_image.permute(1, 2, 0).detach().cpu().numpy()
     ax_im.imshow(img_cpu)
-    ax_im.set_title(f"Image (idx {sample_idx})")
+    spatial_mismatch = raw_image.shape != masked_image.shape
+    title_suffix = (
+        f" (file {raw_image.shape[-2]}×{raw_image.shape[-1]})"
+        if spatial_mismatch
+        else ""
+    )
+    ax_im.set_title(f"Image (idx {sample_idx}){title_suffix}")
     ax_im.axis("off")
 
     _mr = dataset.mask_object_ratio
@@ -817,9 +846,20 @@ def visualize_image_and_density(
         ratio = "mask off"
     else:
         ratio = f"mask ratio={_mr}"
-    ax_masked.imshow(masked_image.permute(1, 2, 0).detach().cpu().numpy())
+    masked_vis = masked_image
+    if use_dataset_item:
+        t = masked_vis.detach()
+        if t.min() < -0.01 or t.max() > 1.01:
+            # timm ViT default_cfg often uses mean=std=0.5 → tensor = (x - 0.5) / 0.5
+            masked_vis = (t * 0.5 + 0.5).clamp(0.0, 1.0)
+    ax_masked.imshow(masked_vis.permute(1, 2, 0).detach().cpu().numpy())
+    _spatial_note = (
+        f"\ninput {masked_image.shape[-2]}×{masked_image.shape[-1]}"
+        if spatial_mismatch
+        else ""
+    )
     ax_masked.set_title(
-        f"Masked image\n({ratio}, {dataset.mask_mode}"
+        f"Masked image{_spatial_note}\n({ratio}, {dataset.mask_mode}"
         + (", same as __getitem__)" if use_dataset_item else ")")
     )
     ax_masked.axis("off")
@@ -856,6 +896,35 @@ def visualize_image_and_density(
             ax_pred.set_title("Pred density")
         ax_pred.axis("off")
         plt.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.04)
+
+    for j in range(ncols):
+        row1[j].axis("off")
+        row1[j].set_facecolor("0.97")
+
+    row1[gt_col].text(
+        0.5,
+        0.5,
+        _density_stats_text(density),
+        transform=row1[gt_col].transAxes,
+        ha="center",
+        va="center",
+        fontsize=8,
+        family="monospace",
+    )
+    row1[gt_col].set_title("GT numbers", fontsize=9, pad=4)
+
+    if pred_arr is not None and pred_col is not None:
+        row1[pred_col].text(
+            0.5,
+            0.5,
+            _density_stats_text(pred_arr),
+            transform=row1[pred_col].transAxes,
+            ha="center",
+            va="center",
+            fontsize=8,
+            family="monospace",
+        )
+        row1[pred_col].set_title("Pred numbers", fontsize=9, pad=4)
 
     plt.tight_layout()
 
