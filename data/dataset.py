@@ -473,114 +473,122 @@ def visualize_csrnet_patch_augmented_dataset(
     *,
     include_mirrored: bool = False,
     figsize_per_panel: Tuple[float, float] = (4.0, 4.0),
+    density_cmap: str = "jet",
     save_path: Optional[Union[str, Path]] = "csrnet_patch_visualization.png",
     show: bool = True,
 ) -> None:
     """
     Visualize one original image together with all CSRNet quarter-sized patches.
 
-    The first panel shows the original image with crop boxes overlaid.
-    The remaining panels show the cropped patches in the same order used by
-    PatchAugmentedDataset.
+    Calls ``ObjectCountingDataset.__getitem__`` for the base image, then crops
+    the result so panels reflect the actual training data (masking, density, etc.).
+
+    The first column shows the full-size processed image (image / masked / density).
+    Each subsequent column shows one patch variant.
     """
     if base_idx < 0 or base_idx >= len(dataset.dataset):
         raise IndexError("base_idx out of range for base dataset")
     if not isinstance(dataset.dataset, ObjectCountingDataset):
         raise TypeError(
             "visualize_csrnet_patch_augmented_dataset expects "
-            "CSRNetPatchAugmentedDataset wrapping ObjectCountingDataset."
+            "PatchAugmentedDataset wrapping ObjectCountingDataset."
         )
 
     base_dataset = dataset.dataset
-    item = base_dataset.samples[base_idx]
-    image_path = item["image_path"]
-    if base_dataset.root is not None:
-        image_path = base_dataset.root / image_path
-    else:
-        image_path = Path(image_path)
+    base_sample = base_dataset[base_idx]
 
-    image = _load_image(image_path)
-    _, height, width = image.shape
-    image_np = image.permute(1, 2, 0).cpu().numpy()
+    masked_image = base_sample["image"]           # (3,H,W) — already masked by __getitem__
+    density = base_sample["density"]              # (1,H,W)
+    count = float(base_sample["count"].item())
+    has_original = "original_image" in base_sample
+    original_image = base_sample["original_image"] if has_original else masked_image
+    _, height, width = masked_image.shape
 
-    patch_panels: List[Tuple[str, np.ndarray, Tuple[int, int, int, int], bool]] = []
+    def _to_np(t: torch.Tensor) -> np.ndarray:
+        t = t.detach().cpu()
+        if t.min() < -0.01 or t.max() > 1.01:
+            t = (t * 0.5 + 0.5).clamp(0.0, 1.0)
+        return t.permute(1, 2, 0).numpy()
+
     total_variants = dataset.variants_per_image if include_mirrored and dataset.mirror else dataset.base_variants_per_image
-
-    for variant_idx in range(total_variants):
-        crop_variant, flip = dataset.decode_variant_index(variant_idx)
-        top, left, crop_h, crop_w = dataset._crop_params(
-            base_idx,
-            crop_variant,
-            height,
-            width,
-        )
-        patch = image[:, top : top + crop_h, left : left + crop_w]
-        if flip:
-            patch = torch.flip(patch, dims=[2])
-
-        if crop_variant < 4:
-            label = f"Quarter {crop_variant + 1}"
-        else:
-            label = f"Random {crop_variant - 3}"
-        if flip:
-            label += " (mirrored)"
-
-        patch_panels.append(
-            (
-                label,
-                patch.permute(1, 2, 0).cpu().numpy(),
-                (top, left, crop_h, crop_w),
-                flip,
-            )
-        )
-
-    total_panels = 1 + len(patch_panels)
-    cols = min(5, total_panels)
-    rows = (total_panels + cols - 1) // cols
+    n_rows = 3 if has_original else 2  # [original], masked, density
+    n_cols = 1 + total_variants        # full image + patches
     fig, axes = plt.subplots(
-        rows,
-        cols,
-        figsize=(figsize_per_panel[0] * cols, figsize_per_panel[1] * rows),
+        n_rows,
+        n_cols,
+        figsize=(figsize_per_panel[0] * n_cols, figsize_per_panel[1] * n_rows),
+        squeeze=False,
     )
-    axes = np.atleast_1d(axes).reshape(rows, cols)
-    axes_flat = axes.ravel()
 
-    ax_original = axes_flat[0]
-    ax_original.imshow(image_np)
-    ax_original.set_title(f"Original image #{base_idx}")
-    ax_original.axis("off")
+    row = 0
+    if has_original:
+        axes[row, 0].imshow(_to_np(original_image))
+        axes[row, 0].set_title(f"Original #{base_idx} ({width}×{height})")
+        axes[row, 0].axis("off")
+        row += 1
+
+    axes[row, 0].imshow(_to_np(masked_image))
+    axes[row, 0].set_title(f"Masked (ratio={base_dataset.mask_object_ratio})")
+    axes[row, 0].axis("off")
+    crop_box_row = row
+
+    den_np = density.squeeze(0).detach().cpu().numpy()
+    den_row = row + 1
+    im0 = axes[den_row, 0].imshow(den_np, cmap=density_cmap)
+    axes[den_row, 0].set_title(f"Density (count≈{count:.1f})")
+    axes[den_row, 0].axis("off")
+    plt.colorbar(im0, ax=axes[den_row, 0], fraction=0.046, pad=0.04)
 
     box_colors = ["tab:red", "tab:blue", "tab:green", "tab:purple"]
     random_color = "tab:orange"
-    for crop_idx, (label, _, (top, left, crop_h, crop_w), _) in enumerate(patch_panels):
-        color = box_colors[crop_idx] if crop_idx < 4 else random_color
+
+    for variant_idx in range(total_variants):
+        col = variant_idx + 1
+        crop_variant, flip = dataset.decode_variant_index(variant_idx)
+        top, left, crop_h, crop_w = dataset._crop_params(
+            base_idx, crop_variant, height, width,
+        )
+
+        if crop_variant < 4:
+            label = f"Q{crop_variant + 1}"
+        else:
+            label = f"R{crop_variant - 3}"
+        if flip:
+            label += " (flip)"
+
+        color = box_colors[crop_variant] if crop_variant < 4 else random_color
         rect = Rectangle(
-            (left, top),
-            crop_w,
-            crop_h,
-            fill=False,
-            edgecolor=color,
-            linewidth=2,
-            linestyle="--" if "mirrored" in label else "-",
+            (left, top), crop_w, crop_h,
+            fill=False, edgecolor=color, linewidth=2,
+            linestyle="--" if flip else "-",
         )
-        ax_original.add_patch(rect)
-        ax_original.text(
-            left + 4,
-            top + 18,
-            label,
-            color="white",
-            fontsize=8,
-            bbox={"facecolor": color, "alpha": 0.8, "pad": 2},
-        )
+        axes[crop_box_row, 0].add_patch(rect)
 
-    for panel_idx, (label, patch_np, _, _) in enumerate(patch_panels, start=1):
-        ax = axes_flat[panel_idx]
-        ax.imshow(patch_np)
-        ax.set_title(label)
-        ax.axis("off")
+        def _crop_and_flip(t: torch.Tensor) -> torch.Tensor:
+            c = t[:, top : top + crop_h, left : left + crop_w]
+            if flip:
+                c = torch.flip(c, dims=[2])
+            return c
 
-    for ax in axes_flat[total_panels:]:
-        ax.axis("off")
+        r = 0
+        if has_original:
+            patch_orig = _crop_and_flip(original_image)
+            axes[r, col].imshow(_to_np(patch_orig))
+            axes[r, col].set_title(label)
+            axes[r, col].axis("off")
+            r += 1
+
+        patch_masked = _crop_and_flip(masked_image)
+        axes[r, col].imshow(_to_np(patch_masked))
+        axes[r, col].set_title(label)
+        axes[r, col].axis("off")
+
+        patch_den = _crop_and_flip(density).squeeze(0).detach().cpu().numpy()
+        patch_count = float(patch_den.sum())
+        r += 1
+        im_d = axes[r, col].imshow(patch_den, cmap=density_cmap)
+        axes[r, col].set_title(f"{label}\ncount≈{patch_count:.1f}")
+        axes[r, col].axis("off")
 
     plt.tight_layout()
 

@@ -263,7 +263,7 @@ if __name__ == "__main__":
         train_dataset = PatchAugmentedDataset(
             train_full_dataset,
             random_crops_per_image=5,
-            mirror=False,
+            mirror=True,
             # seed=42,
             transform=train_transform,
         )

@@ -112,7 +112,7 @@ def build_optimizer_param_groups(
         )
     if enc_decay:
         groups.append(
-            {"params": enc_decay, "lr": backbone_lr, "weight_decay": weight_decay, "group_name": "encoder_decay"}
+            {"params": enc_decay, "lr": backbone_lr, "weight_decay": 0.05, "group_name": "encoder_decay"}
         )
 
     if not groups:
@@ -534,7 +534,7 @@ def train(
             _vis_first_idx = 0
 
     backbone_unfreeze_done = False
-
+    count_weight_increase_done = False
     for epoch in range(1, epochs + 1):
         if(not backbone_unfreeze_done
             and unfreeze_backbone_after_epoch is not None
@@ -557,6 +557,12 @@ def train(
                 f"encoder was already trainable."
             )
             backbone_unfreeze_done = True
+
+
+        if(epoch > 25 and not count_weight_increase_done):
+            count_loss_weight = count_loss_weight * 10
+            print(f"Epoch {epoch:03d} | Count loss weight increased to {count_loss_weight:.4f}")
+            count_weight_increase_done = True
 
         train_loss, train_mae = train_one_epoch(
             model,
@@ -613,10 +619,12 @@ def train(
             print(
                 f"Epoch {epoch:03d} | "
                 f"lr {lr_str} | "
+                f"Train MAE {train_mae:.4f} | "
+                f"weighted train mae {(train_mae*count_loss_weight):.4f} | "
+                f"train mse {(train_loss - train_mae*count_loss_weight)} | "
                 f"total loss {train_loss:.4f} | "
-                f"Train MAE {train_mae:.2f} | "
-                f"Val MAE {val_mae:.2f} | "
-                f"Best MAE {best_mae:.2f}"
+                f"Val MAE {val_mae:.4f} | "
+                f"Best MAE {best_mae:.4f}"
             )
 
             if val_mae < best_mae:
