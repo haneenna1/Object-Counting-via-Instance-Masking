@@ -11,11 +11,8 @@ class _DecoderBlock(nn.Module):
         self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
         self.conv = nn.Sequential(
             nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout),
             nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
         )
 

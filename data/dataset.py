@@ -288,7 +288,6 @@ class ObjectCountingDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-
         item = self.samples[idx]
 
         image_path = item["image_path"]

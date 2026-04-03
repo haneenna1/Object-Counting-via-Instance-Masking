@@ -176,6 +176,7 @@ def density_from_points_csrnet_reference(
     points: List[Tuple[float, float]],
     *,
     kdtree_leafsize: int = 2048,
+    **kwargs,
 ) -> np.ndarray:
     """
     CSRNet reference preprocessing (``make_dataset.ipynb`` / CrowdNet-style):

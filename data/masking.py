@@ -31,7 +31,7 @@ def _box_hw_from_scale(scale: float, aspect_hw: Tuple[int, int]) -> Tuple[int, i
 
 def _mask_from_dots(shape, points, params) -> np.ndarray:
     """
-    Binary mask: for each dot, mask a box centered at the dot.
+    Binary mask: for each dot, mask a box anchored at the dot and extending downward.
     If ``dot_sigmas`` is provided (same length as ``points``), each box side is
     ``sigma_to_box * sigma_i`` so it matches geometry-adaptive density kernels.
     """
@@ -58,15 +58,23 @@ def _mask_from_dots(shape, points, params) -> np.ndarray:
         else:
             box_h, box_w = box_size
 
-        # print(f"box_h: {box_h}, box_w: {box_w}")
-        half_h, half_w = box_h // 2, box_w // 2
+        half_w = box_w // 2
         ix, iy = int(round(x)), int(round(y))
 
-        y1 = max(0, iy - half_h)
-        y2 = min(H, iy - half_h + box_h)
+        y1 = max(0, iy-half_w)
+        y2 = min(H, iy -half_w + box_h)
 
         x1 = max(0, ix - half_w)
         x2 = min(W, ix - half_w + box_w)
+
+        # Clip y2 so the box stops before any other dot below this one
+        for j, (xj, yj) in enumerate(points):
+            if j == i:
+                continue
+            jx, jy = int(round(xj)), int(round(yj))
+            if  y1<=jy<y2 and x1<=jx<x2:
+                y2 = jy
+                # print(f"Clipped y2 from {y2} to {jy}")
 
         mask[y1:y2, x1:x2] = 1
 
