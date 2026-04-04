@@ -1,6 +1,8 @@
 from pathlib import Path
 import argparse
+import sys
 import warnings
+from datetime import datetime
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -33,6 +35,22 @@ from model.unet import UNetDensity
 from model.csrnet import CSRNet, load_vgg16_frontend
 from model.vit_density import ViTDensity
 from training.train import train, DEFAULT_DENSITY_SCALE
+
+
+class _Tee:
+    """Write to both a terminal stream and a log file."""
+
+    def __init__(self, terminal, log_file):
+        self.terminal = terminal
+        self.log_file = log_file
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log_file.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
 
 
 def parse_args() -> argparse.Namespace:
@@ -184,6 +202,22 @@ if __name__ == "__main__":
             "only the decoder is trained.",
             stacklevel=1,
         )
+    # Build log path: <output_dir>/<run_tag>/train-<date>.log
+    mask_str = "nomsk" if args.mask_ratio is None else f"{args.mask_ratio}-{args.mask_mode or 'inpaint'}"
+    run_tag = f"{args.model}-{args.data_name}-{mask_str}"
+    date_str = datetime.now().strftime("%Y-%m-%d-%Hh")
+
+    log_dir = Path(args.output_dir) / args.model / run_tag
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"train-{date_str}.log"
+
+    log_file = open(log_path, "w")
+    sys.stdout = _Tee(sys.stdout, log_file)
+    sys.stderr = _Tee(sys.stderr, log_file)
+    print(f"Logging to {log_path}")
+
+    print(args)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # transform = compose_transforms(
     # #     # random_90deg_rotation_transform,
@@ -220,7 +254,7 @@ if __name__ == "__main__":
         )
 
     dataset_kwargs = dict(
-        root="/home/haneenn/.cache/kagglehub/datasets/tthien/shanghaitech/versions/1/ShanghaiTech",
+        root="./ShanghaiTech",
         part=["part_B"],
         density_map_dir=DENSITY_MAP_DIR_AUTO,
         keep_original_image=False,
@@ -236,6 +270,8 @@ if __name__ == "__main__":
         split="train_data",
         mask_object_ratio=args.mask_ratio,
         mask_mode=args.mask_mode,
+        mask_dot_box_aspect=(3, 1),
+        mask_dot_sigma_to_box=6.0,
         # transform=train_transform,
     )
 
