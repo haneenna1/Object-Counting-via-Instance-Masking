@@ -179,6 +179,7 @@ def compute_loss(
     loss_mode: str = "density_mse_count_l1",
     density_scale: float = DEFAULT_DENSITY_SCALE,
     gt_downsample: str = "bilinear",
+    mask: torch.Tensor = None,
 ):
     """
     gt_density: raw from dataloader (integral ≈ count).
@@ -289,6 +290,7 @@ def train_one_epoch(
 
         images = batch["image"].to(device)
         gt_density = batch["density"].to(device)
+        mask = batch["mask"].to(device)
 
         optimizer.zero_grad()
 
@@ -301,6 +303,7 @@ def train_one_epoch(
             loss_mode=loss_mode,
             density_scale=density_scale,
             gt_downsample=gt_downsample,
+            mask=mask,
         )
         with torch.no_grad():
             pred_count, gt_count = _counts_from_densities(
@@ -315,8 +318,7 @@ def train_one_epoch(
 
         batch_size = images.size(0)
 
-        # total_loss += loss.item() * batch_size
-        total_loss += loss.item()
+        total_loss += loss.item() * batch_size
 
 
         total_mae += mae.item()
@@ -404,6 +406,7 @@ def train(
     data_name: str = "data",
     mask_ratio: float | None = None,
     mask_mode: str | None = None,
+    mask_dot_style: str | None = None,
     output_dir: str | Path = "trained_models",
     density_scale: float = DEFAULT_DENSITY_SCALE,
     gt_downsample: str = "bilinear",
@@ -424,7 +427,7 @@ def train(
         f"with {epochs} epochs, batch size: {batch_size}, loss mode: {loss_mode}, "
         f"count loss weight: {count_loss_weight}, density scale: {density_scale}, "
         f"gt_downsample: {gt_downsample}, "
-        f"mask ratio: {mask_ratio}, mask mode: {mask_mode}, "
+        f"mask ratio: {mask_ratio}, mask mode: {mask_mode}, mask dot style: {mask_dot_style or 'box'}, "
         f"optimizer: {optimizer_type}, lr: {lr}"
     )
 
@@ -509,6 +512,8 @@ def train(
         mask_str = "nomsk"
     else:
         mask_str = f"{mask_ratio}-{mask_mode or 'inpaint'}"
+        if mask_dot_style and mask_dot_style != "box":
+            mask_str = f"{mask_str}-{mask_dot_style}"
     run_name = f"{model_name}-{data_name}-{mask_str}"
     
     output_dir = Path(output_dir) / model_name / run_name
@@ -534,7 +539,8 @@ def train(
             _vis_first_idx = 0
 
     backbone_unfreeze_done = False
-    count_weight_increase_done = False
+    count_weight_increase_done_1 = False
+    count_weight_increase_done_2 = False
     for epoch in range(1, epochs + 1):
         if(not backbone_unfreeze_done
             and unfreeze_backbone_after_epoch is not None
@@ -559,10 +565,14 @@ def train(
             backbone_unfreeze_done = True
 
 
-        if(epoch > 25 and not count_weight_increase_done):
+        if(epoch > 25 and not count_weight_increase_done_1):
             count_loss_weight = count_loss_weight * 10
             print(f"Epoch {epoch:03d} | Count loss weight increased to {count_loss_weight:.4f}")
-            count_weight_increase_done = True
+            count_weight_increase_done_1 = True
+        if(epoch > 100 and not count_weight_increase_done_2):
+            count_loss_weight = count_loss_weight * 10
+            print(f"Epoch {epoch:03d} | Count loss weight increased to {count_loss_weight:.4f}")
+            count_weight_increase_done_2 = True
 
         train_loss, train_mae = train_one_epoch(
             model,
@@ -620,8 +630,8 @@ def train(
                 f"Epoch {epoch:03d} | "
                 f"lr {lr_str} | "
                 f"Train MAE {train_mae:.4f} | "
-                f"weighted train mae {(train_mae*count_loss_weight):.4f} | "
-                f"train mse {(train_loss - train_mae*count_loss_weight)} | "
+                f"weighted train mae {train_mae*count_loss_weight:.4f} | "
+                f"train mse {(train_loss - train_mae*count_loss_weight):.4f} | "
                 f"total loss {train_loss:.4f} | "
                 f"Val MAE {val_mae:.4f} | "
                 f"Best MAE {best_mae:.4f}"

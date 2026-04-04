@@ -102,6 +102,15 @@ def parse_args() -> argparse.Namespace:
         "'inpaint': mask image only, keep full density target (hallucination task).",
     )
     parser.add_argument(
+        "--mask-dot-style",
+        type=str,
+        default="box",
+        choices=["box", "gaussian"],
+        help="Dot instance mask: 'box' rectangles; 'gaussian' uses CSRNet-sigma disks on the image "
+        "and (with --mask-mode robust) subtracts each masked head's GT Gaussian from density "
+        "instead of multiplying by (1 - mask).",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="trained_models",
@@ -204,6 +213,8 @@ if __name__ == "__main__":
         )
     # Build log path: <output_dir>/<run_tag>/train-<date>.log
     mask_str = "nomsk" if args.mask_ratio is None else f"{args.mask_ratio}-{args.mask_mode or 'inpaint'}"
+    if args.mask_ratio is not None and args.mask_dot_style != "box":
+        mask_str = f"{mask_str}-{args.mask_dot_style}"
     run_tag = f"{args.model}-{args.data_name}-{mask_str}"
     date_str = datetime.now().strftime("%Y-%m-%d-%Hh")
 
@@ -270,6 +281,7 @@ if __name__ == "__main__":
         split="train_data",
         mask_object_ratio=args.mask_ratio,
         mask_mode=args.mask_mode,
+        mask_dot_style=args.mask_dot_style,
         mask_dot_box_aspect=(3, 1),
         mask_dot_sigma_to_box=6.0,
         # transform=train_transform,
@@ -321,6 +333,7 @@ if __name__ == "__main__":
         data_name=args.data_name,
         mask_ratio=args.mask_ratio,
         mask_mode=args.mask_mode,
+        mask_dot_style=args.mask_dot_style,
         output_dir=args.output_dir,
         early_stopping_patience=args.early_stopping_patience,
         density_scale=args.density_scale,

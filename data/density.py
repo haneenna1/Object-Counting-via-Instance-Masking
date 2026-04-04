@@ -3,6 +3,8 @@ Ground-truth density map generation from annotations.
 Uses normalized 2D Gaussians so that the integral over the image approximates the object count.
 """
 
+from functools import lru_cache
+
 import numpy as np
 from typing import List, Tuple, Union
 from scipy.ndimage import gaussian_filter
@@ -38,6 +40,34 @@ def gaussian_2d_patch(
     return g
 
 
+@lru_cache(maxsize=8192)
+def _cached_csrnet_neighbor_dists(pts_bytes: bytes, n: int, leafsize: int) -> np.ndarray:
+    """KDTree k-NN rows for CSRNet-style sigma (and default dot geometry when k<=3)."""
+    pts = np.frombuffer(pts_bytes, dtype=np.float64).reshape(n, 2)
+    tree = KDTree(pts.copy(), leafsize=leafsize)
+    kq = min(4, n)
+    dists, _ = tree.query(pts, k=kq)
+    if dists.ndim == 1:
+        dists = dists.reshape(n, 1)
+    return dists.astype(np.float64, copy=False)
+
+
+def csrnet_neighbor_dists(
+    points: List[Tuple[float, float]],
+    *,
+    kdtree_leafsize: int = 2048,
+) -> np.ndarray:
+    """
+    Distance matrix: column 0 is self (0), columns 1.. are nearest neighbors
+    (up to three when n>=4). Cached per point-set to avoid repeated KDTree work
+    in ``__getitem__`` (mask + CSRNet removal + density build).
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    n = len(pts)
+    if n == 0:
+        return np.zeros((0, 0), dtype=np.float64)
+    return _cached_csrnet_neighbor_dists(pts.tobytes(), n, int(kdtree_leafsize))
+
 
 # ---------------------------------------------------------
 # DOT SIGMAS (shared with instance masking)
@@ -52,6 +82,7 @@ def compute_dot_sigmas(
     beta: float = 0.3,
     min_sigma: float = 4.0,
     max_sigma: float = 15.0,
+    kdtree_leafsize: int = 2048,
 ) -> np.ndarray:
     """
     Per-point Gaussian sigmas for dot annotations (same rule as density map generation).
@@ -66,11 +97,18 @@ def compute_dot_sigmas(
     pts = np.asarray(points, dtype=np.float64)
 
     if geometry_adaptive and n > k:
-        tree = KDTree(pts)
-        dists, _ = tree.query(pts, k=k + 1)
-        dists = dists[:, 1:]
-        mean_dists = dists.mean(axis=1)
-        sigmas = beta * mean_dists
+        kq = min(4, n)
+        if k + 1 <= kq:
+            dists_all = csrnet_neighbor_dists(points, kdtree_leafsize=kdtree_leafsize)
+            dists = dists_all[:, 1 : k + 1]
+            mean_dists = dists.mean(axis=1)
+            sigmas = beta * mean_dists
+        else:
+            tree = KDTree(pts, leafsize=kdtree_leafsize)
+            dists, _ = tree.query(pts, k=k + 1)
+            dists = dists[:, 1:]
+            mean_dists = dists.mean(axis=1)
+            sigmas = beta * mean_dists
         # sigmas = np.clip(sigmas, min_sigma, max_sigma)
     else:
         sigmas = np.full(n, sigma, dtype=np.float64)
@@ -171,6 +209,43 @@ def _csrnet_reference_sigma(
     return float(np.mean(shape) / 4.0)
 
 
+# Match scipy.ndimage.gaussian_filter(..., mode="constant") default truncation.
+_CSRNET_GAUSS_TRUNCATE = 4.0
+
+
+def _accumulate_csrnet_impulse_gaussian(
+    out: np.ndarray,
+    H: int,
+    W: int,
+    y_int: int,
+    x_int: int,
+    sigma: float,
+    *,
+    truncate: float = _CSRNET_GAUSS_TRUNCATE,
+) -> None:
+    """
+    Add ``gaussian_filter(impulse, sigma, mode='constant')`` for a single pixel impulse,
+    using a local patch so each head costs O((truncate*σ)²) instead of O(H*W).
+    """
+    if sigma <= 0:
+        return
+    rad = max(1, int(np.ceil(truncate * float(sigma))))
+    y0 = max(0, y_int - rad)
+    y1 = min(H, y_int + rad + 1)
+    x0 = max(0, x_int - rad)
+    x1 = min(W, x_int + rad + 1)
+    ph, pw = y1 - y0, x1 - x0
+    if ph <= 0 or pw <= 0:
+        return
+    ly, lx = y_int - y0, x_int - x0
+    impulse = np.zeros((ph, pw), dtype=np.float32)
+    impulse[ly, lx] = 1.0
+    blob = gaussian_filter(
+        impulse, sigma, mode="constant", truncate=truncate
+    )
+    out[y0:y1, x0:x1] += blob.astype(np.float32, copy=False)
+
+
 def density_from_points_csrnet_reference(
     shape: Tuple[int, int],
     points: List[Tuple[float, float]],
@@ -193,9 +268,7 @@ def density_from_points_csrnet_reference(
         return density
 
     pts = np.asarray(points, dtype=np.float64)
-    tree = KDTree(pts.copy(), leafsize=kdtree_leafsize)
-    k_query = min(4, n)
-    dists_all, _ = tree.query(pts, k=k_query)
+    dists_all = csrnet_neighbor_dists(points, kdtree_leafsize=kdtree_leafsize)
 
     for i in range(n):
         x_int = int(round(float(pts[i, 0])))
@@ -207,11 +280,42 @@ def density_from_points_csrnet_reference(
         if sigma <= 0:
             sigma = float(np.mean(shape) / 4.0)
 
-        impulse = np.zeros((H, W), dtype=np.float32)
-        impulse[y_int, x_int] = 1.0
-        density += gaussian_filter(impulse, sigma, mode="constant")
+        _accumulate_csrnet_impulse_gaussian(
+            density, H, W, y_int, x_int, sigma
+        )
 
     return density
+
+
+def sum_csrnet_dot_gaussians_for_indices(
+    shape: Tuple[int, int],
+    points: List[Tuple[float, float]],
+    indices: Union[List[int], np.ndarray],
+    *,
+    kdtree_leafsize: int = 2048,
+) -> np.ndarray:
+    """
+    Sum of single-head CSRNet-style density contributions for ``points[i]`` with ``i`` in ``indices``.
+    Sigmas are computed from k-NN on the full ``points`` list (same as the full GT map).
+    """
+    H, W = shape
+    out = np.zeros((H, W), dtype=np.float32)
+    n = len(points)
+    if n == 0 or len(indices) == 0:
+        return out
+    pts = np.asarray(points, dtype=np.float64)
+    dists_all = csrnet_neighbor_dists(points, kdtree_leafsize=kdtree_leafsize)
+    for i in indices:
+        i = int(i)
+        x_int = int(round(float(pts[i, 0])))
+        y_int = int(round(float(pts[i, 1])))
+        if x_int < 0 or x_int >= W or y_int < 0 or y_int >= H:
+            continue
+        sigma = _csrnet_reference_sigma(dists_all[i], n, shape)
+        if sigma <= 0:
+            sigma = float(np.mean(shape) / 4.0)
+        _accumulate_csrnet_impulse_gaussian(out, H, W, y_int, x_int, sigma)
+    return out
 
 
 # ---------------------------------------------------------

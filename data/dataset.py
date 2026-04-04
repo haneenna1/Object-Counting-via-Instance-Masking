@@ -17,7 +17,7 @@ from torch.utils.data import Dataset
 from torchvision.io import read_image
 
 from .annotation_types import AnnotationType
-from .density import density_from_points_csrnet_reference, generate_density
+from .density import generate_density, sum_csrnet_dot_gaussians_for_indices
 from .masking import generate_instance_mask
 from .transforms import crop_sample, horizontal_flip_transform
 
@@ -208,6 +208,11 @@ class ObjectCountingDataset(Dataset):
         mask_mode="inpaint" — mask applied to image only; density stays full.
             The model must learn to "hallucinate" / reconstruct the density
             of masked objects from surrounding context.
+        mask_dot_style (dot annotations only):
+            ``"box"`` — rectangular mask; robust mode uses density * (1 - mask).
+            ``"gaussian"`` — image mask uses ~3σ disks from CSRNet-style sigmas;
+            robust mode subtracts each masked head's GT Gaussian (matches generate_density),
+            instead of zeroing a rectangle in the density map.
     """
 
     def __init__(
@@ -234,6 +239,7 @@ class ObjectCountingDataset(Dataset):
         mask_dot_geometry_max_sigma: float = 15.0,
         mask_object_ratio: Optional[float] = None,
         mask_mode: str = "inpaint",
+        mask_dot_style: str = "box",
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         keep_original_image: bool = False,
         density_map_dir: Optional[Union[str, Path]] = DENSITY_MAP_DIR_AUTO,
@@ -241,6 +247,10 @@ class ObjectCountingDataset(Dataset):
         if mask_mode not in ("robust", "inpaint"):
             raise ValueError(
                 f"mask_mode must be 'robust' or 'inpaint', got {mask_mode!r}"
+            )
+        if mask_dot_style not in ("box", "gaussian"):
+            raise ValueError(
+                f"mask_dot_style must be 'box' or 'gaussian', got {mask_dot_style!r}"
             )
         self.samples = samples
         self.root = Path(root) if root else None
@@ -275,6 +285,7 @@ class ObjectCountingDataset(Dataset):
         self.mask_dot_geometry_max_sigma = mask_dot_geometry_max_sigma
         self.mask_object_ratio = mask_object_ratio
         self.mask_mode = mask_mode
+        self.mask_dot_style = mask_dot_style
         self.transform = transform
         self.keep_original_image = keep_original_image
         if density_map_dir is None:
@@ -346,7 +357,13 @@ class ObjectCountingDataset(Dataset):
         # Raw density: sum ≈ object count (see data/density.py Gaussians).
         count = float(density.sum().item())
 
-        mask = generate_instance_mask(
+        need_masked_idx = (
+            self.mask_mode == "robust"
+            and ann_type == AnnotationType.DOT
+            and self.mask_dot_style == "gaussian"
+            and self.mask_object_ratio not in (None, 0)
+        )
+        mask, masked_idx = generate_instance_mask(
             shape,
             ann_type,
             annotations,
@@ -360,7 +377,28 @@ class ObjectCountingDataset(Dataset):
             dot_geometry_min_sigma=self.mask_dot_geometry_min_sigma,
             dot_geometry_max_sigma=self.mask_dot_geometry_max_sigma,
             mask_object_ratio=self.mask_object_ratio,
+            dot_mask_style=self.mask_dot_style,
+            return_masked_indices=need_masked_idx,
         )
+
+        # Gaussian subtract must stay here (before ``out`` / ``transform``): it uses this
+        # sample's ``shape`` and ``annotations`` in full image space. The robust branch
+        # below runs after ``transform``; moving subtract there would break when the
+        # transform resizes/crops (e.g. ViT dict transform on the dataset).
+        gaussian_density_subtract = (
+            self.mask_mode == "robust"
+            and ann_type == AnnotationType.DOT
+            and self.mask_dot_style == "gaussian"
+            and masked_idx is not None
+            and masked_idx.size > 0
+        )
+        if gaussian_density_subtract:
+            d_np = density.squeeze(0).numpy().astype(np.float32)
+            removed = sum_csrnet_dot_gaussians_for_indices(
+                shape, list(annotations), masked_idx
+            )
+            d_np = np.maximum(d_np - removed.astype(np.float32), 0.0)
+            density = torch.from_numpy(d_np).unsqueeze(0)
 
         mask = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0)
 
@@ -384,11 +422,16 @@ class ObjectCountingDataset(Dataset):
         out["image"] = out["image"] * (1.0 - binary_mask)
 
         if self.mask_mode == "robust":
-            # Also mask density — model learns density of visible objects only.
-            out["density"] = out["density"] * (1.0 - binary_mask)
-            out["count"] = torch.tensor(
-                float(out["density"].sum().item()), dtype=torch.float32
-            )
+            # Also adjust density — model learns density of visible objects only.
+            if gaussian_density_subtract:
+                out["count"] = torch.tensor(
+                    float(out["density"].sum().item()), dtype=torch.float32
+                )
+            else:
+                out["density"] = out["density"] * (1.0 - binary_mask)
+                out["count"] = torch.tensor(
+                    float(out["density"].sum().item()), dtype=torch.float32
+                )
         # "inpaint": density stays full — model must hallucinate masked density.
 
         return out
@@ -600,36 +643,54 @@ def visualize_csrnet_patch_augmented_dataset(
     plt.close(fig)
 
 
+def _object_counting_base_for_visualize(
+    dataset: Union[ObjectCountingDataset, PatchAugmentedDataset],
+) -> Tuple[ObjectCountingDataset, Optional[PatchAugmentedDataset]]:
+    """Return the inner ObjectCountingDataset and optional PatchAugmentedDataset wrapper."""
+    if isinstance(dataset, PatchAugmentedDataset):
+        inner = dataset.dataset
+        if not isinstance(inner, ObjectCountingDataset):
+            raise TypeError(
+                "visualize_image_and_density: PatchAugmentedDataset must wrap ObjectCountingDataset, "
+                f"got {type(inner).__name__}."
+            )
+        return inner, dataset
+    return dataset, None
+
+
 def visualize_image_and_density(
-    dataset: ObjectCountingDataset,
+    dataset: Union[ObjectCountingDataset, PatchAugmentedDataset],
     image_name: Optional[str] = None,
     *,
     index: Optional[int] = None,
+    patch_variant: int = 0,
     figsize: Tuple[float, float] = (12, 5),
     density_cmap: str = "jet",
-    show_count: bool = True,
     use_precomputed_density: bool = False,
     adaptive: bool = True,
     use_dataset_item: bool = True,
     model: Optional[torch.nn.Module] = None,
     pred_density_scale: float = 1.0,
     save_dir: Optional[Union[str, Path]] = "vis/",
-    show: bool = False,
     device: Optional[torch.device] = 'cuda'
 ) -> None:
     """
     Visualize one sample: either by ``index`` into ``dataset`` or by ``image_name`` lookup.
 
     Pass exactly one of:
-      - ``index``: integer in ``[0, len(dataset))`` (same row as ``dataset[index]``).
-      - ``image_name``: filename, stem, or relative path matched against ``sample["image_path"]``.
+      - ``index``: integer in ``[0, len(dataset))`` (same row as ``dataset[index]``). For a
+        ``PatchAugmentedDataset``, this is the **flattened** patch index (``base_idx * variants_per_image + variant``).
+      - ``image_name``: filename, stem, or relative path matched against ``sample["image_path"]`` on the
+        **base** ``ObjectCountingDataset``. If ``dataset`` is ``PatchAugmentedDataset``, use ``patch_variant``
+        in ``[0, variants_per_image)`` to choose which crop/mirror (default ``0``).
+
+    patch_variant: only used with ``image_name=...`` when ``dataset`` is ``PatchAugmentedDataset``; ignored otherwise.
 
     figsize: (width, height) for the figure.
     density_cmap: colormap for the density map (e.g. "jet", "viridis", "hot").
-    show_count: if True, set title to include integral of density (object count).
     use_precomputed_density: when True, load density from dataset.density_map_dir instead of recomputing.
       Ignored when use_dataset_item=True (the dataset __getitem__ path already loads or generates density).
-    use_dataset_item: when True (default), call ``dataset[sample_idx]`` so the mask, masked image, and
+    use_dataset_item: when True (default), call ``dataset[flat_idx]`` so the mask, masked image, and
       target density match the dataloader exactly (including random subsampling of instances).
       Set False only if you want an independent mask/density pass (e.g. legacy comparisons).
       If ``transform`` resizes (e.g. ViT 224×224), the first panel still shows the on-disk image at native
@@ -644,16 +705,23 @@ def visualize_image_and_density(
     if (index is not None) == (image_name is not None):
         raise ValueError("Pass exactly one of index=... or image_name=..., not both and not neither.")
 
+    base_ds, patch_ds = _object_counting_base_for_visualize(dataset)
+
     sample: Optional[Dict[str, Any]] = None
-    sample_idx: Optional[int] = None
+    base_sample_idx: Optional[int] = None
+    flat_idx: Optional[int] = None
     image_name_path: Path
 
     if index is not None:
         n = len(dataset)
         if index < 0 or index >= n:
             raise IndexError(f"index {index} out of range for dataset of length {n}")
-        sample_idx = index
-        sample = dataset.samples[sample_idx]
+        flat_idx = index
+        if patch_ds is not None:
+            base_sample_idx = flat_idx // patch_ds.variants_per_image
+        else:
+            base_sample_idx = flat_idx
+        sample = base_ds.samples[base_sample_idx]
         image_name_path = Path(sample["image_path"])
         name_stem = image_name_path.stem
     else:
@@ -662,41 +730,58 @@ def visualize_image_and_density(
         name_stem = image_name_path.stem
 
         # 1) Prefer exact relative-path match against item["image_path"].
-        for i, item in enumerate(dataset.samples):
+        for i, item in enumerate(base_ds.samples):
             item_path = Path(item["image_path"])
             if image_name_path == item_path:
                 sample = item
-                sample_idx = i
+                base_sample_idx = i
                 break
 
         # 2) Fallback: match by filename if no exact path match was found.
         if sample is None:
-            for i, item in enumerate(dataset.samples):
+            for i, item in enumerate(base_ds.samples):
                 item_path = Path(item["image_path"])
                 if image_name_path.name == item_path.name:
                     sample = item
-                    sample_idx = i
+                    base_sample_idx = i
                     break
 
         if sample is None:
-            paths = [s["image_path"] for s in dataset.samples]
+            paths = [s["image_path"] for s in base_ds.samples]
             hint = paths[:10] if len(paths) > 10 else paths
             raise ValueError(
                 f"No sample found for image name {image_name!r} (stem: {name_stem!r}). "
                 f"Try index=..., or a relative path like one of: {hint}"
             )
 
-    assert sample is not None and sample_idx is not None
+        assert base_sample_idx is not None
+        if patch_ds is not None:
+            v = patch_variant
+            if v < 0 or v >= patch_ds.variants_per_image:
+                raise IndexError(
+                    f"patch_variant {v} out of range for [0, {patch_ds.variants_per_image})"
+                )
+            flat_idx = base_sample_idx * patch_ds.variants_per_image + v
+        else:
+            flat_idx = base_sample_idx
+
+    assert sample is not None and base_sample_idx is not None and flat_idx is not None
+
+    patch_info = ""
+    if patch_ds is not None:
+        v_in_image = flat_idx % patch_ds.variants_per_image
+        crop_v, flipped = patch_ds.decode_variant_index(v_in_image)
+        patch_info = f" patch_var={v_in_image} crop_slot={crop_v} mirror={flipped}"
 
     print(
-        f"visualization: idx={sample_idx} path={image_name_path} precomputed density={use_precomputed_density} "
-        f"use_dataset_item={use_dataset_item} adaptive={adaptive} "
-        f"beta={dataset.density_beta} k={dataset.density_k} min_sigma={dataset.density_min_sigma}"
+        f"visualization: flat_idx={flat_idx} base_idx={base_sample_idx}{patch_info} path={image_name_path} "
+        f"precomputed density={use_precomputed_density} use_dataset_item={use_dataset_item} adaptive={adaptive} "
+        f"beta={base_ds.density_beta} k={base_ds.density_k} min_sigma={base_ds.density_min_sigma}"
     )
 
     image_path = sample["image_path"]
-    if dataset.root is not None:
-        image_path = dataset.root / image_path
+    if base_ds.root is not None:
+        image_path = base_ds.root / image_path
     else:
         image_path = Path(image_path)
 
@@ -707,26 +792,26 @@ def visualize_image_and_density(
     annotations = sample["annotations"]
 
     density_adaptive_label = (
-        dataset.density_geometry_adaptive if use_dataset_item else adaptive
+        base_ds.density_geometry_adaptive if use_dataset_item else adaptive
     )
 
     if use_dataset_item:
-        batch = dataset[sample_idx]
+        batch = dataset[flat_idx]
         masked_image = batch["image"]
         density = batch["density"].squeeze(0).detach().cpu().numpy().astype(np.float32)
         count = float(batch["count"].item())
         infer_image = batch["image"]
     else:
         if use_precomputed_density:
-            if dataset.density_map_dir is None:
+            if base_ds.density_map_dir is None:
                 raise ValueError(
                     "use_precomputed_density=True but dataset.density_map_dir is None. "
                     "Either set density_map_dir when creating the dataset or disable use_precomputed_density."
                 )
             density_path = _density_map_path_for_sample(
                 sample,
-                dataset.root,
-                dataset.density_map_dir,
+                base_ds.root,
+                base_ds.density_map_dir,
             )
             if not density_path.exists():
                 raise FileNotFoundError(
@@ -739,32 +824,33 @@ def visualize_image_and_density(
                 shape,
                 ann_type,
                 annotations,
-                sigma=dataset.density_sigma,
+                sigma=base_ds.density_sigma,
                 geometry_adaptive=adaptive,
-                beta=dataset.density_beta,
-                k=dataset.density_k,
-                min_sigma=dataset.density_min_sigma,
-                sigma_scale_bbox=dataset.density_sigma_scale_bbox,
-                sigma_from_seg_area=dataset.density_sigma_from_seg_area,
-                fixed_sigma_seg=dataset.density_fixed_sigma_seg,
+                beta=base_ds.density_beta,
+                k=base_ds.density_k,
+                min_sigma=base_ds.density_min_sigma,
+                sigma_scale_bbox=base_ds.density_sigma_scale_bbox,
+                sigma_from_seg_area=base_ds.density_sigma_from_seg_area,
+                fixed_sigma_seg=base_ds.density_fixed_sigma_seg,
             )
 
         count = float(np.sum(density))
 
-        inst_mask = generate_instance_mask(
+        inst_mask, _ = generate_instance_mask(
             shape,
             ann_type,
             annotations,
-            dot_box_size=dataset.mask_dot_box_size,
-            dot_box_aspect=dataset.mask_dot_box_aspect,
-            dot_sigma_to_box=dataset.mask_dot_sigma_to_box,
-            dot_sigma=dataset.mask_dot_sigma,
-            dot_geometry_adaptive=dataset.mask_dot_geometry_adaptive,
-            dot_geometry_beta=dataset.mask_dot_geometry_beta,
-            dot_geometry_k=dataset.mask_dot_geometry_k,
-            dot_geometry_min_sigma=dataset.mask_dot_geometry_min_sigma,
-            dot_geometry_max_sigma=dataset.mask_dot_geometry_max_sigma,
-            mask_object_ratio=dataset.mask_object_ratio,
+            dot_box_size=base_ds.mask_dot_box_size,
+            dot_box_aspect=base_ds.mask_dot_box_aspect,
+            dot_sigma_to_box=base_ds.mask_dot_sigma_to_box,
+            dot_sigma=base_ds.mask_dot_sigma,
+            dot_geometry_adaptive=base_ds.mask_dot_geometry_adaptive,
+            dot_geometry_beta=base_ds.mask_dot_geometry_beta,
+            dot_geometry_k=base_ds.mask_dot_geometry_k,
+            dot_geometry_min_sigma=base_ds.mask_dot_geometry_min_sigma,
+            dot_geometry_max_sigma=base_ds.mask_dot_geometry_max_sigma,
+            mask_object_ratio=base_ds.mask_object_ratio,
+            dot_mask_style=base_ds.mask_dot_style,
         )
         mask_t = torch.from_numpy(inst_mask.astype(np.float32)).unsqueeze(0)
         masked_image = raw_image * (1.0 - mask_t.clamp(0.0, 1.0))
@@ -845,10 +931,15 @@ def visualize_image_and_density(
         if spatial_mismatch
         else ""
     )
-    ax_im.set_title(f"Image (idx {sample_idx}){title_suffix}")
+    idx_title = (
+        f"Image (flat idx {flat_idx}, base {base_sample_idx})"
+        if patch_ds is not None
+        else f"Image (idx {flat_idx})"
+    )
+    ax_im.set_title(f"{idx_title}{title_suffix}")
     ax_im.axis("off")
 
-    _mr = dataset.mask_object_ratio
+    _mr = base_ds.mask_object_ratio
     if _mr is None or float(_mr) <= 0:
         ratio = "mask off"
     else:
@@ -865,10 +956,12 @@ def visualize_image_and_density(
         if spatial_mismatch
         else ""
     )
-    ax_masked.set_title(
-        f"Masked image{_spatial_note}\n({ratio}, {dataset.mask_mode}"
+    _masked_title = (
+        f"Masked image{_spatial_note}\n({ratio}, {base_ds.mask_mode}"
         + (", same as __getitem__)" if use_dataset_item else ")")
     )
+    _masked_title += f"\ncount ≈ {count:.1f}"
+    ax_masked.set_title(_masked_title)
     ax_masked.axis("off")
 
     if has_dots:
@@ -885,11 +978,9 @@ def visualize_image_and_density(
         + (
             f"\n(count ≈ {count:.1f})"
             f"\nadaptive={density_adaptive_label} "
-            f"beta={dataset.density_beta} "
-            f"\nk={dataset.density_k} "
-            f"min_sigma={dataset.density_min_sigma} "
-            if show_count
-            else ""
+            f"beta={base_ds.density_beta} "
+            f"\nk={base_ds.density_k} "
+            f"min_sigma={base_ds.density_min_sigma} "
         )
     )
     ax_den.axis("off")
@@ -897,10 +988,7 @@ def visualize_image_and_density(
 
     if pred_arr is not None and ax_pred is not None:
         im_pred = ax_pred.imshow(pred_arr, cmap=density_cmap)
-        if show_count and pred_count is not None:
-            ax_pred.set_title(f"Pred density (count ≈ {pred_count:.1f})")
-        else:
-            ax_pred.set_title("Pred density")
+        ax_pred.set_title(f"Pred density (count ≈ {pred_count:.1f})")
         ax_pred.axis("off")
         plt.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.04)
 
@@ -937,7 +1025,11 @@ def visualize_image_and_density(
 
     # Save to file when requested (useful on headless/SSH setups).
     if save_dir is not None:
-        save_path = Path(save_dir) / f"{name_stem}.png"
+        # Same base image → same stem; patch wrapper needs flat_idx so files do not overwrite.
+        if patch_ds is not None:
+            save_path = Path(save_dir) / f"{name_stem}_patch{flat_idx:05d}.png"
+        else:
+            save_path = Path(save_dir) / f"{name_stem}.png"
         plt.savefig(str(save_path), dpi=150)
         plt.close()
     else:

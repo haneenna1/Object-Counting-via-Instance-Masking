@@ -4,7 +4,7 @@ Produces a binary mask indicating which pixels belong to annotated instances.
 """
 
 import numpy as np
-from typing import List, Tuple, Union, Optional
+from typing import List, Tuple, Union, Optional, Literal
 
 from .annotation_types import AnnotationType
 from .density import compute_dot_sigmas
@@ -77,6 +77,68 @@ def _mask_from_dots(shape, points, params) -> np.ndarray:
                 # print(f"Clipped y2 from {y2} to {jy}")
 
         mask[y1:y2, x1:x2] = 1
+
+    return mask
+
+
+def _mask_from_dots_gaussian_footprint(
+    shape: Tuple[int, int],
+    all_points: List[Tuple[float, float]],
+    masked_indices: np.ndarray,
+    sigmas: np.ndarray,
+    *,
+    truncate_sigma: float = 2.0,
+    clip_disks: bool = True,
+) -> np.ndarray:
+    """
+    Binary mask: for each masked dot (index into ``all_points``), fill a disk of radius
+    ``ceil(truncate_sigma * sigma_i)`` where ``sigma_i`` comes from ``sigmas`` (same length
+    as ``all_points``), typically from :func:`compute_dot_sigmas` on the full point set.
+
+    When ``clip_disks`` is True (default), each radius is reduced so that (i) disks for two
+    masked dots do not overlap (symmetric cap at half the center distance), and (ii) no
+    unmasked annotation center lies inside a masked dot's disk—so one blob does not swallow
+    a neighbor head that stays visible.
+    """
+    H, W = shape
+    mask = np.zeros((H, W), dtype=np.uint8)
+    if masked_indices.size == 0:
+        return mask
+    pts = np.asarray(all_points, dtype=np.float64)
+    n = len(all_points)
+    if sigmas.shape[0] != n:
+        raise ValueError(
+            f"sigmas length {sigmas.shape[0]} != len(all_points) {len(all_points)}"
+        )
+    masked_set = frozenset(int(j) for j in masked_indices.ravel())
+    for i in masked_indices:
+        i = int(i)
+        s = float(sigmas[i])
+        r = max(1, int(np.ceil(truncate_sigma * s)))
+        if clip_disks:
+            for j in range(n):
+                if j == i:
+                    continue
+                dx = float(pts[i, 0] - pts[j, 0])
+                dy = float(pts[i, 1] - pts[j, 1])
+                d = float(np.hypot(dx, dy))
+                if d <= 0.0:
+                    continue
+                if j in masked_set:
+                    r = min(r, max(0, int(np.floor(0.5 * d - 1e-6))))
+                else:
+                    r = min(r, max(0, int(np.floor(d - 1e-6))))
+        if r < 1:
+            continue
+        ix = int(round(float(pts[i, 0])))
+        iy = int(round(float(pts[i, 1])))
+        y0, y1 = max(0, iy - r), min(H, iy + r + 1)
+        x0, x1 = max(0, ix - r), min(W, ix + r + 1)
+        if y0 >= y1 or x0 >= x1:
+            continue
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        disk = (yy - iy) ** 2 + (xx - ix) ** 2 <= r * r
+        mask[y0:y1, x0:x1] = np.maximum(mask[y0:y1, x0:x1], disk.astype(np.uint8))
 
     return mask
 
@@ -156,26 +218,45 @@ def generate_instance_mask(
     dot_geometry_min_sigma: float = 4.0,
     dot_geometry_max_sigma: float = 15.0,
     mask_object_ratio: Optional[float] = None,
-) -> np.ndarray:
+    dot_mask_style: Literal["box", "gaussian"] = "box",
+    return_masked_indices: bool = False,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Generate a binary instance mask from annotations.
     If mask_object_ratio is None or 0, returns an all-zeros mask (no masking).
 
+    Always returns ``(mask, masked_idx)``. When ``return_masked_indices`` is False,
+    ``masked_idx`` is None. When True, ``masked_idx`` is an int64 array of indices into
+    ``annotations`` for the masked subset (empty when no masking).
+
     dot_box_aspect:
         (height, width) integer ratio for each dot rectangle, e.g. ``(2, 1)`` → height is twice the width.
         Ignored when ``dot_box_size`` is a ``(height, width)`` tuple (explicit pixels).
+
+    dot_mask_style (dot annotations only):
+        ``"box"``: rectangle per dot (``dot_box_size`` / sigma-scaled box), current behavior.
+        ``"gaussian"``: disk mask using :func:`compute_dot_sigmas` (same hyperparameters as
+        box sizing); with robust density handling, GT density still subtracts CSRNet-style
+        Gaussians in ``dataset`` (see ``sum_csrnet_dot_gaussians_for_indices``).
     """
     H, W = shape
-    if mask_object_ratio is None or mask_object_ratio == 0:
-        return np.zeros((H, W), dtype=np.uint8)
+    if dot_mask_style not in ("box", "gaussian"):
+        raise ValueError(f"dot_mask_style must be 'box' or 'gaussian', got {dot_mask_style!r}")
 
-    anns = list(annotations)
+    empty_idx = np.array([], dtype=np.int64)
+
+    if mask_object_ratio is None or mask_object_ratio == 0:
+        z = np.zeros((H, W), dtype=np.uint8)
+        return z, empty_idx if return_masked_indices else None
+
+    all_anns = list(annotations)
+    n = len(all_anns)
 
     dot_sigmas = None
-    if annotation_type == AnnotationType.DOT and dot_box_size is None and len(anns) > 0:
-        # kNN on the full annotation set so sigmas match generate_density(...)
+    if annotation_type == AnnotationType.DOT and dot_box_size is None and n > 0:
+        # kNN on the full annotation set so sigmas match box sizing / geometry
         dot_sigmas = compute_dot_sigmas(
-            anns,
+            all_anns,
             sigma=dot_sigma,
             geometry_adaptive=dot_geometry_adaptive,
             k=dot_geometry_k,
@@ -183,28 +264,42 @@ def generate_instance_mask(
             min_sigma=dot_geometry_min_sigma,
             max_sigma=dot_geometry_max_sigma,
         )
-       
 
-    # optional subsampling of objects
-    if len(anns) > 0:
+    r = max(0.0, min(1.0, float(mask_object_ratio)))
+    k = int(round(r * n)) if n > 0 else 0
+    k = max(0, min(n, k))
 
-        r = max(0.0, min(1.0, float(mask_object_ratio)))
-        k = int(round(r * len(anns)))
-        k = max(0, min(len(anns), k))
+    if k < n:
+        idx = np.random.choice(n, size=k, replace=False)
+    else:
+        idx = np.arange(n, dtype=np.int64)
 
-        if k < len(anns):
-            idx = np.random.choice(len(anns), size=k, replace=False)
-            anns = [anns[i] for i in idx]
-            if dot_sigmas is not None:
-                dot_sigmas = dot_sigmas[idx]
+    masked_anns = [all_anns[i] for i in idx]
+    dot_sigmas_masked = dot_sigmas[idx] if dot_sigmas is not None else None
 
-    params = dict(
-        dot_box_size=dot_box_size,
-        dot_box_aspect=dot_box_aspect,
-        dot_sigma_to_box=dot_sigma_to_box,
-        dot_sigma=dot_sigma,
-        dot_sigmas=dot_sigmas,
-    )
+    if annotation_type == AnnotationType.DOT and dot_mask_style == "gaussian":
+        g_sigmas = dot_sigmas
+        if g_sigmas is None:
+            g_sigmas = compute_dot_sigmas(
+                all_anns,
+                sigma=dot_sigma,
+                geometry_adaptive=dot_geometry_adaptive,
+                k=dot_geometry_k,
+                beta=dot_geometry_beta,
+                min_sigma=dot_geometry_min_sigma,
+                max_sigma=dot_geometry_max_sigma,
+            )
+        mask = _mask_from_dots_gaussian_footprint(
+            shape, all_anns, idx, g_sigmas
+        )
+    else:
+        params = dict(
+            dot_box_size=dot_box_size,
+            dot_box_aspect=dot_box_aspect,
+            dot_sigma_to_box=dot_sigma_to_box,
+            dot_sigma=dot_sigma,
+            dot_sigmas=dot_sigmas_masked,
+        )
+        mask = MASK_GENERATORS[annotation_type](shape, masked_anns, params)
 
-    mask = MASK_GENERATORS[annotation_type](shape, anns, params)
-    return mask
+    return mask, idx if return_masked_indices else None
