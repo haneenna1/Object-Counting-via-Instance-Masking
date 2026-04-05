@@ -89,12 +89,19 @@ def _density_map_path_for_sample(
 
 class PatchAugmentedDataset(Dataset):
     """
-    Expand each base sample into CSRNet-style quarter-sized training patches.
+    Expand each base sample into spatial crops with separate scales for corners vs randoms.
 
-    For every image this wrapper yields:
-    - 4 fixed quarter crops (top-left, top-right, bottom-left, bottom-right)
-    - 5 additional random crops of the same size
+    Patch height and width are ``max(1, min(H, int(H * s)))`` (same for ``W``) for scale ``s``.
+
+    For each image:
+    - 4 fixed corner crops at ``fixed_patch_scale`` (top-left, top-right, bottom-left, bottom-right)
+    - ``random_crops_per_image`` random-position crops **per** entry in ``random_patch_scale``
+      (a float counts as one entry). Random crops use their own scale, independent of corners.
     - optional horizontal mirrors of all crops
+
+    Example: ``fixed_patch_scale=0.5``, ``random_patch_scale=0.75`` — quarters for corners,
+    larger windows for random crops. Use ``random_patch_scale=(0.5, 0.9)`` for two random scales
+    (``2 * random_crops_per_image`` random variants).
     """
 
     def __init__(
@@ -102,6 +109,8 @@ class PatchAugmentedDataset(Dataset):
         dataset: Dataset,
         *,
         random_crops_per_image: int = 5,
+        fixed_patch_scale: float = 0.5,
+        random_patch_scale: Union[float, Tuple[float, ...]] = 0.5,
         mirror: bool = True,
         seed: int = 0,
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
@@ -109,12 +118,28 @@ class PatchAugmentedDataset(Dataset):
         if random_crops_per_image < 0:
             raise ValueError("random_crops_per_image must be >= 0")
 
+        fix_s = float(fixed_patch_scale)
+        if not (0.0 < fix_s <= 1.0):
+            raise ValueError(f"fixed_patch_scale must be in (0, 1], got {fix_s}")
+
+        if isinstance(random_patch_scale, (list, tuple)):
+            rnd_scales = tuple(float(s) for s in random_patch_scale)
+        else:
+            rnd_scales = (float(random_patch_scale),)
+        if not rnd_scales:
+            raise ValueError("random_patch_scale must be a float or a non-empty sequence")
+        for s in rnd_scales:
+            if not (0.0 < s <= 1.0):
+                raise ValueError(f"random_patch_scale entries must be in (0, 1], got {s}")
+
         self.dataset = dataset
         self.random_crops_per_image = random_crops_per_image
+        self.fixed_patch_scale = fix_s
+        self.random_patch_scales = rnd_scales
         self.mirror = mirror
         self.seed = seed
         self.transform = transform
-        self.base_variants_per_image = 4 + self.random_crops_per_image
+        self.base_variants_per_image = 4 + len(self.random_patch_scales) * self.random_crops_per_image
         self.variants_per_image = self.base_variants_per_image * (2 if self.mirror else 1)
 
     def __len__(self) -> int:
@@ -122,7 +147,7 @@ class PatchAugmentedDataset(Dataset):
 
     def decode_variant_index(self, variant_idx: int) -> Tuple[int, bool]:
         if variant_idx < 0 or variant_idx >= self.variants_per_image:
-            raise IndexError("CSRNetPatchAugmentedDataset variant index out of range")
+            raise IndexError("PatchAugmentedDataset variant index out of range")
         flip = self.mirror and variant_idx >= self.base_variants_per_image
         crop_variant = variant_idx % self.base_variants_per_image
         return crop_variant, flip
@@ -134,8 +159,15 @@ class PatchAugmentedDataset(Dataset):
         height: int,
         width: int,
     ) -> Tuple[int, int, int, int]:
-        crop_h = max(1, height // 2)
-        crop_w = max(1, width // 2)
+        if crop_variant < 4:
+            frac = self.fixed_patch_scale
+        else:
+            rel = crop_variant - 4
+            scale_idx = rel // self.random_crops_per_image
+            frac = self.random_patch_scales[scale_idx]
+
+        crop_h = max(1, min(height, int(height * frac)))
+        crop_w = max(1, min(width, int(width * frac)))
         max_top = max(height - crop_h, 0)
         max_left = max(width - crop_w, 0)
 
@@ -149,7 +181,6 @@ class PatchAugmentedDataset(Dataset):
             top, left = quarter_offsets[crop_variant]
             return top, left, crop_h, crop_w
 
-        random_crop_slot = crop_variant - 4
         # rng_seed = self.seed + base_idx * 1009 + random_crop_slot * 9176
         # rng = random.Random(rng_seed)
         rng = random.Random()
@@ -162,7 +193,7 @@ class PatchAugmentedDataset(Dataset):
         if idx < 0:
             idx += len(self)
         if idx < 0 or idx >= len(self):
-            raise IndexError("CSRNetPatchAugmentedDataset index out of range")
+            raise IndexError("PatchAugmentedDataset index out of range")
 
         base_idx, variant_idx = divmod(idx, self.variants_per_image) # base_idx: index of the original img, variant_idx: index of the variant of same img
         crop_variant, flip = self.decode_variant_index(variant_idx)
@@ -520,7 +551,8 @@ def visualize_csrnet_patch_augmented_dataset(
     show: bool = True,
 ) -> None:
     """
-    Visualize one original image together with all CSRNet quarter-sized patches.
+    Visualize one original image together with all patch variants (``fixed_patch_scale`` /
+    ``random_patch_scales``).
 
     Calls ``ObjectCountingDataset.__getitem__`` for the base image, then crops
     the result so panels reflect the actual training data (masking, density, etc.).
@@ -592,9 +624,15 @@ def visualize_csrnet_patch_augmented_dataset(
         )
 
         if crop_variant < 4:
-            label = f"Q{crop_variant + 1}"
+            frac = dataset.fixed_patch_scale
+            label = f"fix={frac:g} Q{crop_variant + 1}"
         else:
-            label = f"R{crop_variant - 3}"
+            rel = crop_variant - 4
+            r_per = dataset.random_crops_per_image
+            scale_idx = rel // r_per
+            slot = rel % r_per
+            frac = dataset.random_patch_scales[scale_idx]
+            label = f"rnd={frac:g} R{slot + 1}"
         if flip:
             label += " (flip)"
 

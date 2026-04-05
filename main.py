@@ -245,7 +245,8 @@ if __name__ == "__main__":
         load_vgg16_frontend(model, freeze_frontend=args.freeze_encoder)
     elif args.model == "vit":
         model = ViTDensity(
-            encoder_name="vit_small_patch16_224.augreg_in21k_ft_in1k",
+            # encoder_name="vit_small_patch16_224.augreg_in21k_ft_in1k",
+            encoder_name="vit_base_patch16_224.augreg_in21k_ft_in1k",
             pretrained=True,
             freeze_encoder=args.freeze_encoder,
             output_activation="softplus",
@@ -283,7 +284,7 @@ if __name__ == "__main__":
         mask_mode=args.mask_mode,
         mask_dot_style=args.mask_dot_style,
         mask_dot_box_aspect=(3, 1),
-        mask_dot_sigma_to_box=6.0,
+        mask_dot_sigma_to_box=4.0,
         # transform=train_transform,
     )
 
@@ -310,11 +311,13 @@ if __name__ == "__main__":
     else:
         train_dataset = PatchAugmentedDataset(
             train_full_dataset,
-            random_crops_per_image=5,
+            random_crops_per_image=3,
+            fixed_patch_scale=0.5,   # corners: quarter-area style
+            random_patch_scale=0.75,  # randoms: larger windows
             mirror=True,
-            # seed=42,
             transform=train_transform,
         )
+        #   train_dataset = train_full_dataset
         val_dataset = load_shanghaitech_dataset(
             **dataset_kwargs,
             split="test_data",
