@@ -4,7 +4,7 @@ Supports dotted, bbox, and segmentation annotations.
 """
 
 from .annotation_types import AnnotationType
-from .density import density_from_points_csrnet_reference, generate_density
+from .density import generate_density
 from .masking import generate_instance_mask
 from .dataset import (
     PatchAugmentedDataset,
@@ -25,7 +25,6 @@ from .fsc147 import (
 __all__ = [
     "AnnotationType",
     "generate_density",
-    "density_from_points_csrnet_reference",
     "generate_instance_mask",
     "PatchAugmentedDataset",
     "ObjectCountingDataset",

@@ -236,8 +236,8 @@ def generate_instance_mask(
     dot_mask_style (dot annotations only):
         ``"box"``: rectangle per dot (``dot_box_size`` / sigma-scaled box), current behavior.
         ``"gaussian"``: disk mask using :func:`compute_dot_sigmas` (same hyperparameters as
-        box sizing); with robust density handling, GT density still subtracts CSRNet-style
-        Gaussians in ``dataset`` (see ``sum_csrnet_dot_gaussians_for_indices``).
+        box sizing); with robust density handling, GT density subtracts the masked dots'
+        Gaussians in ``dataset`` (see ``sum_dot_gaussians_for_indices``).
     """
     H, W = shape
     if dot_mask_style not in ("box", "gaussian"):

@@ -17,7 +17,7 @@ from torch.utils.data import Dataset
 from torchvision.io import read_image
 
 from .annotation_types import AnnotationType
-from .density import generate_density, sum_csrnet_dot_gaussians_for_indices
+from .density import generate_density, sum_dot_gaussians_for_indices
 from .masking import generate_instance_mask
 from .transforms import crop_sample, horizontal_flip_transform
 
@@ -394,7 +394,7 @@ class ObjectCountingDataset(Dataset):
         )
         if gaussian_density_subtract:
             d_np = density.squeeze(0).numpy().astype(np.float32)
-            removed = sum_csrnet_dot_gaussians_for_indices(
+            removed = sum_dot_gaussians_for_indices(
                 shape, list(annotations), masked_idx
             )
             d_np = np.maximum(d_np - removed.astype(np.float32), 0.0)

@@ -33,7 +33,7 @@ from torch.optim.lr_scheduler import SequentialLR, CosineAnnealingLR
 from data.dataset import PatchAugmentedDataset
 from data.dataset import visualize_image_and_density
 
-
+import os
 # Default training scale (only applied in this module, not in dataset).
 DEFAULT_DENSITY_SCALE = 255.0
 
@@ -463,7 +463,8 @@ def train(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=8,
+            num_workers=os.cpu_count(),
+            persistent_workers=True,
             pin_memory=True,
         )
         val_batch_size=batch_size
@@ -478,7 +479,7 @@ def train(
             val_dataset,
             batch_size=val_batch_size,
             shuffle=False,
-            num_workers=8,
+            num_workers=os.cpu_count(),
             pin_memory=True,
         )
     elif early_stopping_patience is not None:
