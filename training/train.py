@@ -176,21 +176,32 @@ def compute_loss(
     pred_density,
     gt_density,
     count_loss_weight: float = 1.0,
+    invisible_density_weight: float = 1.0,
+    invisible_count_weight: float = 1.0,
     loss_mode: str = "density_mse_count_l1",
     density_scale: float = DEFAULT_DENSITY_SCALE,
     gt_downsample: str = "bilinear",
     mask: torch.Tensor = None,
+    eps: float = 1e-6,
 ):
     """
-    gt_density: raw from dataloader (integral ≈ count).
-    ``gt_downsample``: ``bilinear`` (area-correct + ``* density_scale``) or
-    ``csrnet_cubic`` (OpenCV cubic + ×64, use ``density_scale=1``).
+    Density + count loss with explicit visible / invisible supervision.
+
+    Key features:
+    - Area-correct density resizing
+    - Mask-aware density MSE (normalized)
+    - Region-normalized count loss (prevents bias from mask size)
+    - Separate weighting for invisible regions
     """
+
     if gt_downsample not in ("bilinear", "csrnet_cubic"):
         raise ValueError(f"gt_downsample must be 'bilinear' or 'csrnet_cubic', got {gt_downsample!r}")
 
     H_pred, W_pred = pred_density.shape[-2:]
-    gt_for_count = gt_density
+
+    # -----------------------------
+    # Resize GT density (preserve count)
+    # -----------------------------
     if pred_density.shape[-2:] != gt_density.shape[-2:]:
         if gt_downsample == "csrnet_cubic":
             gt_resized = downsample_gt_csrnet_cubic(gt_density, H_pred, W_pred)
@@ -213,19 +224,79 @@ def compute_loss(
         gt_for_count = gt_density
         gt_target = gt_density * density_scale
 
-    density_loss = F.mse_loss(pred_density, gt_target)
-    # density_loss = F.mse_loss(pred_density, gt_target, reduction="sum")
+    # -----------------------------
+    # No mask case (standard loss)
+    # -----------------------------
+    if mask is None:
+        density_loss = F.mse_loss(pred_density, gt_target)
 
-    pred_count = pred_density.sum(dim=(1, 2, 3)) / density_scale
-    gt_count = gt_for_count.sum(dim=(1, 2, 3))
+        pred_count = pred_density.sum(dim=(1, 2, 3)) / density_scale
+        gt_count = gt_for_count.sum(dim=(1, 2, 3))
+
+        if loss_mode == "density_mse_count_mse":
+            count_loss = F.mse_loss(pred_count, gt_count)
+        else:
+            count_loss = F.l1_loss(pred_count, gt_count)
+
+        return density_loss + count_loss_weight * count_loss
+
+    # -----------------------------
+    # Mask handling
+    # -----------------------------
+    if mask.shape[-2:] != pred_density.shape[-2:]:
+        mask = F.interpolate(mask, size=pred_density.shape[-2:], mode="nearest")
+
+    mask = mask.clamp(0.0, 1.0)
+    vis_mask = 1.0 - mask
+
+    # -----------------------------
+    # Density loss (region-normalized)
+    # -----------------------------
+    sq_err = (pred_density - gt_target) ** 2
+
+    vis_err = (sq_err * vis_mask).sum(dim=(1, 2, 3))
+    inv_err = (sq_err * mask).sum(dim=(1, 2, 3))
+
+    vis_pix = vis_mask.sum(dim=(1, 2, 3)).clamp_min(eps)
+    inv_pix = mask.sum(dim=(1, 2, 3)).clamp_min(eps)
+
+    inv_w_den = float(invisible_density_weight)
+
+    density_loss = (
+        (vis_err / vis_pix) +
+        inv_w_den * (inv_err / inv_pix)
+    ).mean()
+
+    # -----------------------------
+    # Count loss (region-normalized)
+    # -----------------------------
+    pred_raw = pred_density / density_scale
+
+    pred_visible_count = (pred_raw * vis_mask).sum(dim=(1, 2, 3))
+    pred_invisible_count = (pred_raw * mask).sum(dim=(1, 2, 3))
+
+    gt_visible_count = (gt_for_count * vis_mask).sum(dim=(1, 2, 3))
+    gt_invisible_count = (gt_for_count * mask).sum(dim=(1, 2, 3))
 
     if loss_mode == "density_mse_count_mse":
-        count_loss = F.mse_loss(pred_count, gt_count)
+        vis_count_err = (pred_visible_count - gt_visible_count) ** 2
+        inv_count_err = (pred_invisible_count - gt_invisible_count) ** 2
     else:
-        count_loss = F.l1_loss(pred_count, gt_count)
+        vis_count_err = torch.abs(pred_visible_count - gt_visible_count)
+        inv_count_err = torch.abs(pred_invisible_count - gt_invisible_count)
 
+    # Normalize by region size → critical fix
+    vis_count_err = vis_count_err / vis_pix
+    inv_count_err = inv_count_err / inv_pix
+
+    inv_w_cnt = float(invisible_count_weight)
+
+    count_loss = (vis_count_err + inv_w_cnt * inv_count_err).mean()
+
+    # -----------------------------
+    # Final loss
+    # -----------------------------
     return density_loss + count_loss_weight * count_loss
-
 
 # -----------------------------
 # Count helpers
@@ -275,8 +346,11 @@ def train_one_epoch(
     device,
     count_loss_weight: float = 1.0,
     loss_mode: str = "density_mse_count_l1",
+    invisible_density_weight: float = 1.0,
+    invisible_count_weight: float = 1.0,
     density_scale: float = DEFAULT_DENSITY_SCALE,
     gt_downsample: str = "bilinear",
+    mask_mode: str | None = None,
     max_grad_norm: float | None = 1.0,
 ):
 
@@ -300,10 +374,13 @@ def train_one_epoch(
             pred_density,
             gt_density,
             count_loss_weight=count_loss_weight,
+            invisible_density_weight=invisible_density_weight,
+            invisible_count_weight=invisible_count_weight,
             loss_mode=loss_mode,
             density_scale=density_scale,
             gt_downsample=gt_downsample,
             mask=mask,
+            mask_mode=mask_mode,
         )
         with torch.no_grad():
             pred_count, gt_count = _counts_from_densities(
@@ -400,6 +477,8 @@ def train(
     epochs: int = 400,
     batch_size: int = 8,
     count_loss_weight: float = 1.0,
+    invisible_density_weight: float = 1.0,
+    invisible_count_weight: float = 1.0,
     loss_mode: str = "density_mse_count_l1",
     early_stopping_patience: int | None = None,
     model_name: str = "model",
@@ -426,6 +505,8 @@ def train(
         device,
         f"with {epochs} epochs, batch size: {batch_size}, loss mode: {loss_mode}, "
         f"count loss weight: {count_loss_weight}, density scale: {density_scale}, "
+        f"invisible density weight: {invisible_density_weight}, "
+        f"invisible count weight: {invisible_count_weight}, "
         f"gt_downsample: {gt_downsample}, "
         f"mask ratio: {mask_ratio}, mask mode: {mask_mode}, mask dot style: {mask_dot_style or 'box'}, "
         f"optimizer: {optimizer_type}, lr: {lr}"
@@ -566,14 +647,14 @@ def train(
             backbone_unfreeze_done = True
 
 
-        if(epoch > 25 and not count_weight_increase_done_1):
-            count_loss_weight = count_loss_weight * 10
+        if(epoch > 0 and  epoch%20 == 0 and count_loss_weight <= 0.01):
+            count_loss_weight = count_loss_weight * 2
             print(f"Epoch {epoch:03d} | Count loss weight increased to {count_loss_weight:.4f}")
             count_weight_increase_done_1 = True
-        if(epoch > 100 and not count_weight_increase_done_2):
-            count_loss_weight = count_loss_weight * 10
-            print(f"Epoch {epoch:03d} | Count loss weight increased to {count_loss_weight:.4f}")
-            count_weight_increase_done_2 = True
+        # if(epoch > 100 and not count_weight_increase_done_2):
+        #     count_loss_weight = count_loss_weight * 10
+        #     print(f"Epoch {epoch:03d} | Count loss weight increased to {count_loss_weight:.4f}")
+        #     count_weight_increase_done_2 = True
 
         train_loss, train_mae = train_one_epoch(
             model,
@@ -581,9 +662,12 @@ def train(
             optimizer,
             device,
             count_loss_weight=count_loss_weight,
+            invisible_density_weight=invisible_density_weight,
+            invisible_count_weight=invisible_count_weight,
             loss_mode=loss_mode,
             density_scale=density_scale,
             gt_downsample=gt_downsample,
+            mask_mode=mask_mode,
             max_grad_norm=max_grad_norm,
         )
 

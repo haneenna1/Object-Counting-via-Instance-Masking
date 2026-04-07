@@ -82,6 +82,19 @@ def parse_args() -> argparse.Namespace:
         help="Weight for the count loss term.",
     )
     parser.add_argument(
+        "--invisible-density-weight",
+        type=float,
+        default=1.0,
+        help="Invisible-region weight inside split density loss. 1.0 reproduces previous full-map MSE.",
+    )
+    parser.add_argument(
+        "--invisible-count-weight",
+        type=float,
+        default=1.0,
+        help="Weight on invisible-region count error vs visible in split count loss "
+        "(L1 or MSE per region, then weighted sum).",
+    )
+    parser.add_argument(
         "--data-name",
         type=str,
         default="shng-A",
@@ -332,6 +345,8 @@ if __name__ == "__main__":
     train_kw = dict(
         epochs=args.epochs,
         count_loss_weight=args.count_loss_weight,
+        invisible_density_weight=args.invisible_density_weight,
+        invisible_count_weight=args.invisible_count_weight,
         model_name=args.model,
         data_name=args.data_name,
         mask_ratio=args.mask_ratio,
