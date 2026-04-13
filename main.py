@@ -202,6 +202,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable validation during training.",
     )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=str,
+        default=None,
+        help="Path to a *-latest.pth file saved during training. Restores model, optimizer, "
+        "LR scheduler, epoch, best MAE, early-stopping counter, and history when present in the file.",
+    )
     return parser.parse_args()
 
 
@@ -335,6 +342,9 @@ if __name__ == "__main__":
             **dataset_kwargs,
             split="test_data",
             mask_object_ratio=None,
+            # mask_object_ratio=args.mask_ratio,
+            # mask_mode=args.mask_mode,
+            # mask_dot_style=args.mask_dot_style,
             transform=eval_transform,
         )
 
@@ -363,6 +373,7 @@ if __name__ == "__main__":
         momentum=args.momentum,
         weight_decay=args.weight_decay,
         unfreeze_backbone_after_epoch=args.unfreeze_backbone_after_epoch,
+        resume_checkpoint=args.resume_checkpoint,
     )
     if args.model == "csrnet":
         train_kw["gt_downsample"] = "csrnet_cubic"

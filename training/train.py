@@ -182,6 +182,7 @@ def compute_loss(
     density_scale: float = DEFAULT_DENSITY_SCALE,
     gt_downsample: str = "bilinear",
     mask: torch.Tensor = None,
+    mask_mode: str = "robust",
     eps: float = 1e-6,
 ):
     """
@@ -225,9 +226,9 @@ def compute_loss(
         gt_target = gt_density * density_scale
 
     # -----------------------------
-    # No mask case (standard loss)
+    # visible objects only case (standard loss)
     # -----------------------------
-    if mask is None:
+    if mask is None or not mask.any() or mask_mode == "robust":
         density_loss = F.mse_loss(pred_density, gt_target)
 
         pred_count = pred_density.sum(dim=(1, 2, 3)) / density_scale
@@ -241,7 +242,7 @@ def compute_loss(
         return density_loss + count_loss_weight * count_loss
 
     # -----------------------------
-    # Mask handling
+    # inpaint mask handling
     # -----------------------------
     if mask.shape[-2:] != pred_density.shape[-2:]:
         mask = F.interpolate(mask, size=pred_density.shape[-2:], mode="nearest")
@@ -496,6 +497,7 @@ def train(
     weight_decay: float = 5e-4,
     unfreeze_backbone_after_epoch: int | None = None,
     max_grad_norm: float | None = 1.0,
+    resume_checkpoint: str | Path | None = None,
 ):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -544,8 +546,8 @@ def train(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=os.cpu_count(),
-            persistent_workers=True,
+            num_workers=8,
+            # persistent_workers=True,
             pin_memory=True,
         )
         val_batch_size=batch_size
@@ -560,7 +562,7 @@ def train(
             val_dataset,
             batch_size=val_batch_size,
             shuffle=False,
-            num_workers=os.cpu_count(),
+            num_workers=4,
             pin_memory=True,
         )
     elif early_stopping_patience is not None:
@@ -568,7 +570,35 @@ def train(
 
     if not any(p.requires_grad for p in model.parameters()):
         raise RuntimeError("No trainable parameters (check freeze_encoder / masking).")
-    
+
+    start_epoch = 1
+    completed_epoch = 0
+    ckpt: dict | None = None
+    if resume_checkpoint is not None:
+        resume_path = Path(resume_checkpoint).expanduser().resolve()
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        completed_epoch = int(ckpt["epoch"])
+        if (
+            unfreeze_backbone_after_epoch is not None
+            and hasattr(model, "encoder")
+            and completed_epoch > unfreeze_backbone_after_epoch
+        ):
+            for p in model.encoder.parameters():
+                p.requires_grad = True
+        start_epoch = completed_epoch + 1
+        print(
+            f"Loaded checkpoint {resume_path} "
+            f"(completed epoch {completed_epoch}); continuing from epoch {start_epoch}."
+        )
+        if start_epoch > epochs:
+            raise ValueError(
+                f"Checkpoint epoch {completed_epoch} already finished training (--epochs {epochs}); "
+                "increase --epochs or use a different checkpoint."
+            )
+
     backbone_lr = lr * 0.1
     param_groups = build_optimizer_param_groups(model, lr, backbone_lr, weight_decay)
 
@@ -589,6 +619,52 @@ def train(
         milestones=[warmup_epochs]
     )
 
+    best_mae = float("inf")
+    epochs_without_improvement = 0
+    history: dict = {
+        "train_loss": [],
+        "train_mae": [],
+        "val_mae": [],
+    }
+    backbone_unfreeze_done = False
+    count_weight_increase_done_1 = False
+    count_weight_increase_done_2 = False
+
+    if ckpt is not None:
+        if "lr_scheduler_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            lr_scheduler.load_state_dict(ckpt["lr_scheduler_state_dict"])
+        else:
+            print(
+                "Warning: checkpoint has no lr_scheduler_state_dict (old format). "
+                "Replaying scheduler steps to align state, then restoring optimizer tensors."
+            )
+            for _ in range(completed_epoch):
+                lr_scheduler.step()
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "best_mae" in ckpt and ckpt["best_mae"] is not None:
+            best_mae = ckpt["best_mae"]
+        if "epochs_without_improvement" in ckpt:
+            epochs_without_improvement = int(ckpt["epochs_without_improvement"])
+        if "history" in ckpt and isinstance(ckpt["history"], dict):
+            history = {
+                "train_loss": list(ckpt["history"].get("train_loss", [])),
+                "train_mae": list(ckpt["history"].get("train_mae", [])),
+                "val_mae": list(ckpt["history"].get("val_mae", [])),
+            }
+        if "count_loss_weight" in ckpt:
+            count_loss_weight = float(ckpt["count_loss_weight"])
+        if ckpt.get("backbone_unfreeze_done") is True:
+            backbone_unfreeze_done = True
+        elif (
+            unfreeze_backbone_after_epoch is not None
+            and completed_epoch > unfreeze_backbone_after_epoch
+        ):
+            backbone_unfreeze_done = True
+        if ckpt.get("count_weight_increase_done_1") is True:
+            count_weight_increase_done_1 = True
+        if ckpt.get("count_weight_increase_done_2") is True:
+            count_weight_increase_done_2 = True
 
     if mask_ratio is None:
         mask_str = "nomsk"
@@ -601,15 +677,6 @@ def train(
     output_dir = Path(output_dir) / model_name / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    best_mae = float("inf")
-    epochs_without_improvement = 0
-
-    history = {
-        "train_loss": [],
-        "train_mae": [],
-        "val_mae": [],
-    }
-
     # Resolve base dataset + first sample index for val visualization.
     if val_loader is not None:
         _vds = val_loader.dataset
@@ -620,10 +687,7 @@ def train(
             _vis_base_ds = _vds
             _vis_first_idx = 0
 
-    backbone_unfreeze_done = False
-    count_weight_increase_done_1 = False
-    count_weight_increase_done_2 = False
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         if(not backbone_unfreeze_done
             and unfreeze_backbone_after_epoch is not None
             and hasattr(model, "encoder")
@@ -707,7 +771,14 @@ def train(
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "lr_scheduler_state_dict": lr_scheduler.state_dict(),
             "best_mae": best_mae,
+            "epochs_without_improvement": epochs_without_improvement,
+            "history": history,
+            "count_loss_weight": count_loss_weight,
+            "backbone_unfreeze_done": backbone_unfreeze_done,
+            "count_weight_increase_done_1": count_weight_increase_done_1,
+            "count_weight_increase_done_2": count_weight_increase_done_2,
         }, latest_path)
 
         if val_mae is not None:
