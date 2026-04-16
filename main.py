@@ -101,6 +101,13 @@ def parse_args() -> argparse.Namespace:
         help="Short identifier for the dataset (used in saved filenames).",
     )
     parser.add_argument(
+        "--data-part",
+        type=str,
+        default="part_B",
+        choices=["part_A", "part_B"],
+        help="ShanghaiTech partition to train/evaluate on.",
+    )
+    parser.add_argument(
         "--mask-ratio",
         type=float,
         default=None,
@@ -122,6 +129,17 @@ def parse_args() -> argparse.Namespace:
         help="Dot instance mask: 'box' rectangles; 'gaussian' uses CSRNet-sigma disks on the image "
         "and (with --mask-mode robust) subtracts each masked head's GT Gaussian from density "
         "instead of multiplying by (1 - mask).",
+    )
+    parser.add_argument(
+        "--deterministic-masks",
+        action="store_true",
+        help="Use deterministic per-sample masked-instance selection.",
+    )
+    parser.add_argument(
+        "--mask-seed",
+        type=int,
+        default=None,
+        help="Base seed for deterministic masks. Effective seed is (mask_seed + sample_idx).",
     )
     parser.add_argument(
         "--output-dir",
@@ -235,7 +253,10 @@ if __name__ == "__main__":
     mask_str = "nomsk" if args.mask_ratio is None else f"{args.mask_ratio}-{args.mask_mode or 'inpaint'}"
     if args.mask_ratio is not None and args.mask_dot_style != "box":
         mask_str = f"{mask_str}-{args.mask_dot_style}"
-    run_tag = f"{args.model}-{args.data_name}-{mask_str}"
+    mask_sampling_mode = "deterministic" if args.deterministic_masks else "random"
+    if args.mask_ratio is not None:
+        mask_str = f"{mask_str}-{mask_sampling_mode}"
+    run_tag = f"{args.model}-{args.data_name}-{args.data_part}-{mask_str}"
     date_str = datetime.now().strftime("%Y-%m-%d-%Hh")
 
     log_dir = Path(args.output_dir) / args.model / run_tag
@@ -287,7 +308,7 @@ if __name__ == "__main__":
 
     dataset_kwargs = dict(
         root="./ShanghaiTech",
-        part=["part_B"],
+        part=[args.data_part],
         density_map_dir=DENSITY_MAP_DIR_AUTO,
         keep_original_image=False,
         density_geometry_adaptive=True,
@@ -303,6 +324,8 @@ if __name__ == "__main__":
         mask_object_ratio=args.mask_ratio,
         mask_mode=args.mask_mode,
         mask_dot_style=args.mask_dot_style,
+        deterministic_masks=args.deterministic_masks,
+        mask_seed=args.mask_seed,
         mask_dot_box_aspect=(3, 1),
         mask_dot_sigma_to_box=4.0,
         # transform=train_transform,
@@ -362,6 +385,7 @@ if __name__ == "__main__":
         mask_ratio=args.mask_ratio,
         mask_mode=args.mask_mode,
         mask_dot_style=args.mask_dot_style,
+        mask_sampling_mode=mask_sampling_mode,
         output_dir=args.output_dir,
         early_stopping_patience=args.early_stopping_patience,
         density_scale=args.density_scale,
@@ -374,6 +398,7 @@ if __name__ == "__main__":
         weight_decay=args.weight_decay,
         unfreeze_backbone_after_epoch=args.unfreeze_backbone_after_epoch,
         resume_checkpoint=args.resume_checkpoint,
+        log_dir=log_dir,
     )
     if args.model == "csrnet":
         train_kw["gt_downsample"] = "csrnet_cubic"

@@ -207,6 +207,8 @@ def _build_eval_dataset(args, model) -> tuple[object, str, float]:
         mask_object_ratio=args.mask_ratio,
         mask_mode=args.mask_mode,
         mask_dot_style=args.mask_dot_style,
+        deterministic_masks=args.deterministic_masks,
+        mask_seed=args.mask_seed,
         transform=eval_transform,
     )
     gt_downsample = "csrnet_cubic" if args.model == "csrnet" else "bilinear"
@@ -224,6 +226,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-ratio", type=float, default=None)
     parser.add_argument("--mask-mode", type=str, default="inpaint", choices=["robust", "inpaint"])
     parser.add_argument("--mask-dot-style", type=str, default="box", choices=["box", "gaussian"])
+    parser.add_argument("--deterministic-masks", action="store_true")
+    parser.add_argument("--mask-seed", type=int, default=None)
     parser.add_argument("--freeze-encoder", action="store_true")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -248,8 +252,13 @@ if __name__ == "__main__":
     else:
         checkpoint_stem = Path(args.checkpoint).stem
         test_data_name = f"{args.part}-{args.split}"
+        test_mask_tag = (
+            f"testmask-{args.mask_ratio:g}"
+            if args.mask_ratio is not None
+            else "testmask-none"
+        )
         date_tag = datetime.now().strftime("%d-%m-%H")
-        run_name = f"{checkpoint_stem}-{test_data_name}-{date_tag}"
+        run_name = f"{checkpoint_stem}-{test_mask_tag}-{test_data_name}-{date_tag}"
 
     metrics = evaluate_model_on_dataset(
         model,

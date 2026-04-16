@@ -40,6 +40,24 @@ def _density_stats_text(arr: np.ndarray) -> str:
     )
 
 
+def _overlay_binary_region_on_image(
+    image_hw3: np.ndarray,
+    mask_hw: np.ndarray,
+    *,
+    color: Tuple[float, float, float] = (1.0, 0.1, 0.1),
+    alpha: float = 0.35,
+) -> np.ndarray:
+    """Tint masked regions with a visible color."""
+    img = np.asarray(image_hw3, dtype=np.float32).copy()
+    m = np.asarray(mask_hw, dtype=np.float32)
+    if m.ndim != 2:
+        m = m.squeeze()
+    m = np.clip(m, 0.0, 1.0)
+    c = np.asarray(color, dtype=np.float32).reshape(1, 1, 3)
+    out = img * (1.0 - alpha * m[..., None]) + c * (alpha * m[..., None])
+    return np.clip(out, 0.0, 1.0)
+
+
 # Ground-truth density maps are unscaled here: integral ≈ object count.
 # Apply training-time scaling only in training/train.py (density_scale) for targets and pred→count.
 
@@ -269,6 +287,8 @@ class ObjectCountingDataset(Dataset):
         mask_dot_geometry_min_sigma: Optional[float] = None,
         mask_dot_geometry_max_sigma: float = 15.0,
         mask_object_ratio: Optional[float] = None,
+        deterministic_masks: bool = False,
+        mask_seed: Optional[int] = None,
         mask_mode: str = "inpaint",
         mask_dot_style: str = "box",
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
@@ -315,6 +335,8 @@ class ObjectCountingDataset(Dataset):
         )
         self.mask_dot_geometry_max_sigma = mask_dot_geometry_max_sigma
         self.mask_object_ratio = mask_object_ratio
+        self.deterministic_masks = deterministic_masks
+        self.mask_seed = mask_seed
         self.mask_mode = mask_mode
         self.mask_dot_style = mask_dot_style
         self.transform = transform
@@ -394,6 +416,11 @@ class ObjectCountingDataset(Dataset):
             and self.mask_dot_style == "gaussian"
             and self.mask_object_ratio not in (None, 0)
         )
+        rng = None
+        if self.deterministic_masks:
+            seed = idx if self.mask_seed is None else int(self.mask_seed) + int(idx)
+            rng = np.random.default_rng(seed)
+
         mask, masked_idx = generate_instance_mask(
             shape,
             ann_type,
@@ -410,6 +437,7 @@ class ObjectCountingDataset(Dataset):
             mask_object_ratio=self.mask_object_ratio,
             dot_mask_style=self.mask_dot_style,
             return_masked_indices=need_masked_idx,
+            rng=rng,
         )
 
         # Gaussian subtract must stay here (before ``out`` / ``transform``): it uses this
@@ -463,7 +491,6 @@ class ObjectCountingDataset(Dataset):
                 out["count"] = torch.tensor(
                     float(out["density"].sum().item()), dtype=torch.float32
                 )
-        # "inpaint": density stays full — model must hallucinate masked density.
 
         return out
 
@@ -833,12 +860,18 @@ def visualize_image_and_density(
         base_ds.density_geometry_adaptive if use_dataset_item else adaptive
     )
 
+    hidden_mask_np: Optional[np.ndarray] = None
+
     if use_dataset_item:
         batch = dataset[flat_idx]
         masked_image = batch["image"]
         density = batch["density"].squeeze(0).detach().cpu().numpy().astype(np.float32)
         count = float(batch["count"].item())
         infer_image = batch["image"]
+        if "mask" in batch:
+            hidden_mask_np = (
+                batch["mask"].squeeze(0).detach().cpu().numpy().astype(np.float32)
+            )
     else:
         if use_precomputed_density:
             if base_ds.density_map_dir is None:
@@ -874,6 +907,11 @@ def visualize_image_and_density(
 
         count = float(np.sum(density))
 
+        vis_rng = None
+        if getattr(base_ds, "deterministic_masks", False):
+            vis_seed = index if getattr(base_ds, "mask_seed", None) is None else int(base_ds.mask_seed) + int(index)
+            vis_rng = np.random.default_rng(vis_seed)
+
         inst_mask, _ = generate_instance_mask(
             shape,
             ann_type,
@@ -889,14 +927,17 @@ def visualize_image_and_density(
             dot_geometry_max_sigma=base_ds.mask_dot_geometry_max_sigma,
             mask_object_ratio=base_ds.mask_object_ratio,
             dot_mask_style=base_ds.mask_dot_style,
+            rng=vis_rng,
         )
         mask_t = torch.from_numpy(inst_mask.astype(np.float32)).unsqueeze(0)
         masked_image = raw_image * (1.0 - mask_t.clamp(0.0, 1.0))
         infer_image = raw_image
+        hidden_mask_np = inst_mask.astype(np.float32)
 
     # Optional model prediction
     pred_arr: Optional[np.ndarray] = None
     pred_count: Optional[float] = None
+    pred_hidden_mask_np: Optional[np.ndarray] = None
     if model is not None:
         model.eval()
         model = model.to(device)
@@ -925,43 +966,48 @@ def visualize_image_and_density(
                 density = density_t.squeeze().numpy()
                 # print(f"gt density interpolated from {H_gt}x{W_gt} to {pred_h}x{pred_w}: {density.shape}")
                 count = float(density.sum())
+                if hidden_mask_np is not None:
+                    hidden_mask_t = (
+                        torch.from_numpy(hidden_mask_np)
+                        .unsqueeze(0)
+                        .unsqueeze(0)
+                        .float()
+                    )
+                    hidden_mask_t = F.interpolate(
+                        hidden_mask_t, size=(pred_h, pred_w), mode="nearest"
+                    )
+                    hidden_mask_np = hidden_mask_t.squeeze().numpy().astype(np.float32)
             # Same units as GT panel (raw density, integral ≈ count); model output is in training scale.
             pred_arr = (pred.squeeze().float() / scale).numpy()
+            if hidden_mask_np is not None:
+                pred_hidden_mask_np = hidden_mask_np
 
     has_dots = ann_type == AnnotationType.DOT and annotations
+    hmask = np.clip(hidden_mask_np, 0.0, 1.0) if hidden_mask_np is not None else None
+    hidden_only_gt: Optional[np.ndarray] = density * hmask if hmask is not None else None
+    hidden_only_pred: Optional[np.ndarray] = None
+    if pred_arr is not None and hmask is not None:
+        hmask_pred = pred_hidden_mask_np if pred_hidden_mask_np is not None else hmask
+        hidden_only_pred = pred_arr * np.clip(hmask_pred, 0.0, 1.0)
 
-    # Layout: row0 = Image | Masked image | [Dots] | GT density | [Pred]
-    #         row1 = empty … | numeric stats under each density map
-    ncols = 3 + (1 if has_dots else 0) + (1 if pred_arr is not None else 0)
-    wscale = max(1.0, ncols / 2.0)
     fig, axes = plt.subplots(
-        2,
-        ncols,
-        figsize=(figsize[0] * wscale, figsize[1] * 1.45),
-        gridspec_kw={"height_ratios": [5.0, 1.25], "hspace": 0.28},
+        3,
+        3,
+        figsize=(figsize[0] * 1.45, figsize[1] * 2.0),
+        gridspec_kw={
+            # Slightly shorter top row + more vertical gap so row-2 titles are not covered
+            "height_ratios": [0.82, 1.0, 1.0],
+            "hspace": 0.42,
+            "wspace": 0.18,
+        },
         squeeze=False,
     )
-    row0 = axes[0]
-    row1 = axes[1]
-    ax_im = row0[0]
-    ax_masked = row0[1]
-    idx = 2
-    if has_dots:
-        ax_dots = row0[idx]
-        idx += 1
-    else:
-        ax_dots = None  # type: ignore[assignment]
-    ax_den = row0[idx]
-    gt_col = idx
-    idx += 1
-    if pred_arr is not None:
-        ax_pred = row0[idx]
-        pred_col = idx
-    else:
-        ax_pred = None  # type: ignore[assignment]
-        pred_col = None
+    for r in range(3):
+        for c in range(3):
+            axes[r, c].axis("off")
 
     img_cpu = raw_image.permute(1, 2, 0).detach().cpu().numpy()
+    ax_im = axes[0, 0]
     ax_im.imshow(img_cpu)
     spatial_mismatch = raw_image.shape != masked_image.shape
     title_suffix = (
@@ -975,7 +1021,6 @@ def visualize_image_and_density(
         else f"Image (idx {flat_idx})"
     )
     ax_im.set_title(f"{idx_title}{title_suffix}")
-    ax_im.axis("off")
 
     _mr = base_ds.mask_object_ratio
     if _mr is None or float(_mr) <= 0:
@@ -988,29 +1033,46 @@ def visualize_image_and_density(
         if t.min() < -0.01 or t.max() > 1.01:
             # timm ViT default_cfg often uses mean=std=0.5 → tensor = (x - 0.5) / 0.5
             masked_vis = (t * 0.5 + 0.5).clamp(0.0, 1.0)
-    ax_masked.imshow(masked_vis.permute(1, 2, 0).detach().cpu().numpy())
+    masked_vis_np = masked_vis.permute(1, 2, 0).detach().cpu().numpy()
+    masked_with_red = (
+        _overlay_binary_region_on_image(
+            masked_vis_np, hmask, color=(1.0, 0.15, 0.15), alpha=0.52
+        )
+        if hmask is not None
+        else masked_vis_np
+    )
+    ax_masked_gt = axes[1, 0]
+    ax_masked_gt.imshow(masked_with_red)
     _spatial_note = (
         f"\ninput {masked_image.shape[-2]}×{masked_image.shape[-1]}"
         if spatial_mismatch
         else ""
     )
-    _masked_title = (
-        f"Masked image{_spatial_note}\n({ratio}, {base_ds.mask_mode}"
-        + (", same as __getitem__)" if use_dataset_item else ")")
-    )
-    _masked_title += f"\ncount ≈ {count:.1f}"
-    ax_masked.set_title(_masked_title)
-    ax_masked.axis("off")
+    _masked_title = f"Masked image (red = invisible){_spatial_note}\n({ratio}, {base_ds.mask_mode})"
+    ax_masked_gt.set_title(_masked_title)
 
+    ax_dots = axes[0, 1]
     if has_dots:
         ax_dots.imshow(img_cpu)
         xs = [p[0] for p in annotations]
         ys = [p[1] for p in annotations]
         ax_dots.scatter(xs, ys, c="lime", s=12, edgecolors="darkgreen", linewidths=0.5, zorder=5)
         ax_dots.set_title(f"Dots ({len(annotations)})")
-        ax_dots.axis("off")
+    else:
+        ax_dots.imshow(img_cpu)
+        ax_dots.set_title("Dots (none)")
 
+    # Row 2
+    ax_den = axes[1, 1]
     im = ax_den.imshow(density, cmap=density_cmap)
+    if hmask is not None:
+        ax_den.contour(
+            hmask,
+            levels=[0.5],
+            colors="white",
+            linewidths=1.1,
+            alpha=0.95,
+        )
     ax_den.set_title(
         f"GT density"
         + (
@@ -1021,45 +1083,65 @@ def visualize_image_and_density(
             f"min_sigma={base_ds.density_min_sigma} "
         )
     )
-    ax_den.axis("off")
     plt.colorbar(im, ax=ax_den, fraction=0.046, pad=0.04)
 
-    if pred_arr is not None and ax_pred is not None:
+    ax_gt_hidden = axes[1, 2]
+    if hidden_only_gt is not None:
+        im_gt_hidden = ax_gt_hidden.imshow(hidden_only_gt, cmap=density_cmap)
+        ax_gt_hidden.set_title(f"GT density on hidden regions\n(count ≈ {float(hidden_only_gt.sum()):.1f})")
+        plt.colorbar(im_gt_hidden, ax=ax_gt_hidden, fraction=0.046, pad=0.04)
+    else:
+        ax_gt_hidden.text(0.5, 0.5, "No hidden regions", ha="center", va="center", transform=ax_gt_hidden.transAxes)
+        ax_gt_hidden.set_title("GT density on hidden regions")
+
+    # Row 3
+    ax_masked_pred = axes[2, 0]
+    ax_masked_pred.imshow(masked_with_red)
+    ax_masked_pred.set_title("Masked image (red = invisible)")
+
+    ax_pred = axes[2, 1]
+    if pred_arr is not None:
         im_pred = ax_pred.imshow(pred_arr, cmap=density_cmap)
+        if hmask is not None:
+            ax_pred.contour(
+                hmask,
+                levels=[0.5],
+                colors="white",
+                linewidths=1.1,
+                alpha=0.95,
+            )
         ax_pred.set_title(f"Pred density (count ≈ {pred_count:.1f})")
-        ax_pred.axis("off")
         plt.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.04)
+    else:
+        ax_pred.text(0.5, 0.5, "No model provided", ha="center", va="center", transform=ax_pred.transAxes)
+        ax_pred.set_title("Pred density")
 
-    for j in range(ncols):
-        row1[j].axis("off")
-        row1[j].set_facecolor("0.97")
+    ax_pred_hidden = axes[2, 2]
+    if hidden_only_pred is not None:
+        im_pred_hidden = ax_pred_hidden.imshow(hidden_only_pred, cmap=density_cmap)
+        ax_pred_hidden.set_title(f"Pred density on hidden regions\n(count ≈ {float(hidden_only_pred.sum()):.1f})")
+        plt.colorbar(im_pred_hidden, ax=ax_pred_hidden, fraction=0.046, pad=0.04)
+    else:
+        if pred_arr is None:
+            msg = "No model provided"
+        elif hmask is None:
+            msg = "No hidden regions"
+        else:
+            msg = "Unavailable"
+        ax_pred_hidden.text(0.5, 0.5, msg, ha="center", va="center", transform=ax_pred_hidden.transAxes)
+        ax_pred_hidden.set_title("Pred density on hidden regions")
 
-    row1[gt_col].text(
+    axes[0, 2].text(
         0.5,
         0.5,
-        _density_stats_text(density),
-        transform=row1[gt_col].transAxes,
+        "Layout:\nRow1: original + dots\nRow2: GT views\nRow3: prediction views",
         ha="center",
         va="center",
-        fontsize=8,
-        family="monospace",
+        transform=axes[0, 2].transAxes,
+        fontsize=10,
     )
-    row1[gt_col].set_title("GT numbers", fontsize=9, pad=4)
 
-    if pred_arr is not None and pred_col is not None:
-        row1[pred_col].text(
-            0.5,
-            0.5,
-            _density_stats_text(pred_arr),
-            transform=row1[pred_col].transAxes,
-            ha="center",
-            va="center",
-            fontsize=8,
-            family="monospace",
-        )
-        row1[pred_col].set_title("Pred numbers", fontsize=9, pad=4)
-
-    plt.tight_layout()
+    plt.tight_layout(h_pad=3.2, w_pad=0.6, pad=0.7, rect=(0.02, 0.02, 0.98, 0.96))
 
     # Save to file when requested (useful on headless/SSH setups).
     if save_dir is not None:

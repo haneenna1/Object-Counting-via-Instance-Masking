@@ -4,3 +4,4 @@ data/shanghaitech_data
 vis/
 ShanghaiTech/
 trained_models/
+inference/results

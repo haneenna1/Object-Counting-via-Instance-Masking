@@ -487,6 +487,7 @@ def train(
     mask_ratio: float | None = None,
     mask_mode: str | None = None,
     mask_dot_style: str | None = None,
+    mask_sampling_mode: str = "random",
     output_dir: str | Path = "trained_models",
     density_scale: float = DEFAULT_DENSITY_SCALE,
     gt_downsample: str = "bilinear",
@@ -498,6 +499,7 @@ def train(
     unfreeze_backbone_after_epoch: int | None = None,
     max_grad_norm: float | None = 1.0,
     resume_checkpoint: str | Path | None = None,
+    log_dir: str | Path | None = None,
 ):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -672,10 +674,12 @@ def train(
         mask_str = f"{mask_ratio}-{mask_mode or 'inpaint'}"
         if mask_dot_style and mask_dot_style != "box":
             mask_str = f"{mask_str}-{mask_dot_style}"
+        mask_str = f"{mask_str}-{mask_sampling_mode}"
     run_name = f"{model_name}-{data_name}-{mask_str}"
     
-    output_dir = Path(output_dir) / model_name / run_name
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # output_dir = Path(output_dir) / model_name / run_name
+    # output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = log_dir
 
     # Resolve base dataset + first sample index for val visualization.
     if val_loader is not None:

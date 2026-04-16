@@ -220,6 +220,7 @@ def generate_instance_mask(
     mask_object_ratio: Optional[float] = None,
     dot_mask_style: Literal["box", "gaussian"] = "box",
     return_masked_indices: bool = False,
+    rng: Optional[np.random.Generator] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Generate a binary instance mask from annotations.
@@ -270,7 +271,10 @@ def generate_instance_mask(
     k = max(0, min(n, k))
 
     if k < n:
-        idx = np.random.choice(n, size=k, replace=False)
+        if rng is None:
+            idx = np.random.choice(n, size=k, replace=False)
+        else:
+            idx = rng.choice(n, size=k, replace=False)
     else:
         idx = np.arange(n, dtype=np.int64)
 
