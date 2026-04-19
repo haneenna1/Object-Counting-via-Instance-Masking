@@ -169,6 +169,36 @@ class PatchBatchSampler(BatchSampler):
         return len(self.dataset.dataset)
 
 
+class CountWeightController:
+    """
+    w(t) = w_max * (1 - mse_ema / mse_ref) ** p, clamped to [0, w_max].
+
+    - mse_ref: a reference MSE (e.g. EMA value at end of warmup).
+    - p > 1 delays the ramp until MSE is well below mse_ref.
+    - p < 1 ramps faster.
+    """
+    def __init__(self, w_max=0.01, p=2.0, ema=0.9, warmup_epochs=5):
+        self.w_max = w_max
+        self.p = p
+        self.ema = ema
+        self.warmup = warmup_epochs
+        self.mse_ema = None
+        self.mse_ref = None
+
+    def update(self, epoch, train_mse):
+        if self.mse_ema is None:
+            self.mse_ema = train_mse
+        else:
+            self.mse_ema = self.ema * self.mse_ema + (1 - self.ema) * train_mse
+
+        if epoch == self.warmup:
+            self.mse_ref = self.mse_ema  # freeze reference after warmup
+
+        if self.mse_ref is None or epoch < self.warmup:
+            return 0.0
+        progress = max(0.0, 1.0 - self.mse_ema / max(self.mse_ref, 1e-8))
+        return self.w_max * (progress ** self.p)
+
 # -----------------------------
 # Loss: density MSE + choice of count loss (MAE or MSE on count)
 # -----------------------------
@@ -297,7 +327,7 @@ def compute_loss(
     # -----------------------------
     # Final loss
     # -----------------------------
-    return density_loss + count_loss_weight * count_loss
+    return density_loss + count_loss_weight * count_loss, density_loss
 
 # -----------------------------
 # Count helpers
@@ -358,6 +388,7 @@ def train_one_epoch(
     model.train()
 
     total_loss = 0.0
+    total_mse = 0.0
     total_mae = 0.0
     total_samples = 0
 
@@ -371,7 +402,7 @@ def train_one_epoch(
 
         pred_density = model(images)
 
-        loss = compute_loss(
+        loss, mse = compute_loss(
             pred_density,
             gt_density,
             count_loss_weight=count_loss_weight,
@@ -397,15 +428,16 @@ def train_one_epoch(
         batch_size = images.size(0)
 
         total_loss += loss.item() * batch_size
-
+        total_mse += mse.item() * batch_size
 
         total_mae += mae.item()
         total_samples += batch_size
 
     avg_loss = total_loss / total_samples
+    avg_mse = total_mse / total_samples
     avg_mae = total_mae / total_samples
 
-    return avg_loss, avg_mae
+    return avg_loss, avg_mae, avg_mse
 
 
 # -----------------------------
@@ -691,6 +723,8 @@ def train(
             _vis_base_ds = _vds
             _vis_first_idx = 0
 
+    count_weight_controller = CountWeightController(w_max=0.01, p=2.0, warmup_epochs=warmup_epochs)
+
     for epoch in range(start_epoch, epochs + 1):
         if(not backbone_unfreeze_done
             and unfreeze_backbone_after_epoch is not None
@@ -715,16 +749,7 @@ def train(
             backbone_unfreeze_done = True
 
 
-        if(epoch > 0 and  epoch%20 == 0 and count_loss_weight <= 0.01):
-            count_loss_weight = count_loss_weight * 2
-            print(f"Epoch {epoch:03d} | Count loss weight increased to {count_loss_weight:.4f}")
-            count_weight_increase_done_1 = True
-        # if(epoch > 100 and not count_weight_increase_done_2):
-        #     count_loss_weight = count_loss_weight * 10
-        #     print(f"Epoch {epoch:03d} | Count loss weight increased to {count_loss_weight:.4f}")
-        #     count_weight_increase_done_2 = True
-
-        train_loss, train_mae = train_one_epoch(
+        train_loss, train_mae, train_mse = train_one_epoch(
             model,
             train_loader,
             optimizer,
@@ -738,8 +763,8 @@ def train(
             mask_mode=mask_mode,
             max_grad_norm=max_grad_norm,
         )
-
-        # Step the scheduler to update the LR
+        count_loss_weight = count_weight_controller.update(epoch, train_mse)         # Step the scheduler to update the LR
+        print(f"Epoch {epoch:03d} | Count loss weight: {count_loss_weight:.4f}")
         lr_scheduler.step()
         
         val_mae = None
@@ -764,6 +789,7 @@ def train(
 
         history["train_loss"].append(train_loss)
         history["train_mae"].append(train_mae)
+        history["train_mse"].append(train_mse)
         if val_mae is not None:
             history["val_mae"].append(val_mae)
 
@@ -791,7 +817,7 @@ def train(
                 f"lr {lr_str} | "
                 f"Train MAE {train_mae:.4f} | "
                 f"weighted train mae {train_mae*count_loss_weight:.4f} | "
-                f"train mse {(train_loss - train_mae*count_loss_weight):.4f} | "
+                f"train mse {train_mse:.4f} | "
                 f"total loss {train_loss:.4f} | "
                 f"Val MAE {val_mae:.4f} | "
                 f"Best MAE {best_mae:.4f}"
