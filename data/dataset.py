@@ -105,6 +105,66 @@ def _density_map_path_for_sample(
     return Path(density_map_dir) / f"{stem}_density.npy"
 
 
+def _density_biased_top_left(
+    density_2d: torch.Tensor,
+    crop_h: int,
+    crop_w: int,
+    uniform_eps: float = 0.1,
+    baseline_frac: float = 0.05,
+) -> Tuple[int, int]:
+    """
+    Sample a ``(top, left)`` for a ``crop_h x crop_w`` window with probability
+    proportional to the density mass inside that window, plus a small uniform baseline
+    so empty regions are still occasionally visited.
+
+    Uses a 2D integral image so the per-window mass is O(1) after an O(HW) setup.
+    Returns (0, 0) if the image is exactly the crop size.
+
+    - ``uniform_eps``: probability of drawing uniformly at random instead (mixture).
+    - ``baseline_frac``: uniform prior added to the window-mass map, as a fraction of the
+      map's maximum. Keeps empty-region probability non-zero and prevents multinomial
+      failure on all-zero inputs.
+    """
+    H, W = int(density_2d.shape[-2]), int(density_2d.shape[-1])
+    max_top = max(H - crop_h, 0)
+    max_left = max(W - crop_w, 0)
+    if max_top == 0 and max_left == 0:
+        return 0, 0
+
+    if random.random() < uniform_eps:
+        top = random.randint(0, max_top) if max_top > 0 else 0
+        left = random.randint(0, max_left) if max_left > 0 else 0
+        return top, left
+
+    d = density_2d.detach().to(torch.float32)
+    if d.ndim > 2:
+        d = d.squeeze()
+    # 2D integral image: I[i, j] = sum of d[:i, :j].
+    I = torch.zeros((H + 1, W + 1), dtype=torch.float32)
+    I[1:, 1:] = d.cumsum(0).cumsum(1)
+    a = I[crop_h : H + 1, crop_w : W + 1]
+    b = I[: H - crop_h + 1, crop_w : W + 1]
+    c = I[crop_h : H + 1, : W - crop_w + 1]
+    e = I[: H - crop_h + 1, : W - crop_w + 1]
+    scores = (a - b - c + e).clamp_min(0.0)  # (max_top+1, max_left+1)
+
+    score_max = float(scores.max())
+    if score_max <= 0.0:
+        # No density anywhere (e.g. robust-mode with all heads masked); fall back to uniform.
+        top = random.randint(0, max_top) if max_top > 0 else 0
+        left = random.randint(0, max_left) if max_left > 0 else 0
+        return top, left
+
+    scores = scores + score_max * float(baseline_frac)
+    flat = scores.flatten()
+    probs = flat / flat.sum()
+    idx = int(torch.multinomial(probs, 1).item())
+    n_left = max_left + 1
+    top = idx // n_left
+    left = idx % n_left
+    return int(top), int(left)
+
+
 class PatchAugmentedDataset(Dataset):
     """
     Expand each base sample into spatial crops with separate scales for corners vs randoms.
@@ -132,7 +192,40 @@ class PatchAugmentedDataset(Dataset):
         mirror: bool = True,
         seed: int = 0,
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        fixed_crop_size: Optional[Tuple[int, int]] = None,
+        density_biased_crops: bool = False,
+        density_bias_uniform_eps: float = 0.1,
+        density_bias_baseline: float = 0.05,
     ) -> None:
+        """
+        fixed_crop_size: when set to ``(H, W)`` (in pixels), every variant returns a
+            ``H x W`` crop at the **native** image resolution -- ``fixed_patch_scale`` /
+            ``random_patch_scale`` are ignored for sizing. Corner variants become the four
+            literal corners of the image (clamped); random variants land anywhere. If the
+            image is smaller than the crop in either dimension, it is padded first
+            (image: reflect; density/mask: zeros, so the count integral is preserved).
+
+            Use this with ``vit_normalize_only_transform`` to remove the train/val
+            distribution shift caused by resize.
+
+        density_biased_crops: when True (requires ``fixed_crop_size``), **all** variant
+            positions -- including the 4 "corner" slots -- are drawn from a distribution
+            where ``p(top, left)`` is proportional to the density mass inside a crop
+            placed at ``(top, left)``. This avoids the "mostly-empty crops" bias you get
+            on datasets like ShanghaiTech part_A with uniform random cropping and corner
+            tiles on images that have people concentrated in the centre.
+
+            With prob ``density_bias_uniform_eps`` we still fall back to a uniform draw
+            so pure-background regions are not completely excluded (the model needs to
+            learn "no people here" too). A small ``density_bias_baseline * max_mass`` is
+            also added to the window-mass map to keep low-density pockets reachable.
+
+        density_bias_uniform_eps: mixing weight on the uniform fallback (default 0.1 =
+            10% of crops are uniform, 90% are density-biased).
+
+        density_bias_baseline: uniform additive baseline for the window-mass
+            distribution, as a fraction of the map's maximum (default 0.05).
+        """
         if random_crops_per_image < 0:
             raise ValueError("random_crops_per_image must be >= 0")
 
@@ -150,6 +243,26 @@ class PatchAugmentedDataset(Dataset):
             if not (0.0 < s <= 1.0):
                 raise ValueError(f"random_patch_scale entries must be in (0, 1], got {s}")
 
+        if fixed_crop_size is not None:
+            ch, cw = fixed_crop_size
+            if int(ch) <= 0 or int(cw) <= 0:
+                raise ValueError(f"fixed_crop_size must be positive, got {fixed_crop_size}")
+            fixed_crop_size = (int(ch), int(cw))
+
+        if density_biased_crops and fixed_crop_size is None:
+            raise ValueError(
+                "density_biased_crops=True requires fixed_crop_size to be set (the "
+                "biased sampler operates at native resolution on a fixed-size window)."
+            )
+        if not (0.0 <= density_bias_uniform_eps <= 1.0):
+            raise ValueError(
+                f"density_bias_uniform_eps must be in [0, 1], got {density_bias_uniform_eps}"
+            )
+        if density_bias_baseline < 0.0:
+            raise ValueError(
+                f"density_bias_baseline must be >= 0, got {density_bias_baseline}"
+            )
+
         self.dataset = dataset
         self.random_crops_per_image = random_crops_per_image
         self.fixed_patch_scale = fix_s
@@ -157,6 +270,10 @@ class PatchAugmentedDataset(Dataset):
         self.mirror = mirror
         self.seed = seed
         self.transform = transform
+        self.fixed_crop_size = fixed_crop_size
+        self.density_biased_crops = bool(density_biased_crops)
+        self.density_bias_uniform_eps = float(density_bias_uniform_eps)
+        self.density_bias_baseline = float(density_bias_baseline)
         self.base_variants_per_image = 4 + len(self.random_patch_scales) * self.random_crops_per_image
         self.variants_per_image = self.base_variants_per_image * (2 if self.mirror else 1)
 
@@ -177,15 +294,21 @@ class PatchAugmentedDataset(Dataset):
         height: int,
         width: int,
     ) -> Tuple[int, int, int, int]:
-        if crop_variant < 4:
+        if self.fixed_crop_size is not None:
+            crop_h, crop_w = self.fixed_crop_size
+            crop_h = max(1, min(height, crop_h))
+            crop_w = max(1, min(width, crop_w))
+        elif crop_variant < 4:
             frac = self.fixed_patch_scale
+            crop_h = max(1, min(height, int(height * frac)))
+            crop_w = max(1, min(width, int(width * frac)))
         else:
             rel = crop_variant - 4
             scale_idx = rel // self.random_crops_per_image
             frac = self.random_patch_scales[scale_idx]
+            crop_h = max(1, min(height, int(height * frac)))
+            crop_w = max(1, min(width, int(width * frac)))
 
-        crop_h = max(1, min(height, int(height * frac)))
-        crop_w = max(1, min(width, int(width * frac)))
         max_top = max(height - crop_h, 0)
         max_left = max(width - crop_w, 0)
 
@@ -218,12 +341,51 @@ class PatchAugmentedDataset(Dataset):
 
         sample = self.dataset[base_idx]
         _, height, width = sample["image"].shape
-        top, left, crop_h, crop_w = self._crop_params(
-            base_idx,
-            crop_variant,
-            height,
-            width,
-        )
+
+        # Pad up to the requested crop size (only used when fixed_crop_size is set).
+        # Image: reflect (keeps natural statistics). Density / mask: zero (preserves count).
+        if self.fixed_crop_size is not None:
+            ch, cw = self.fixed_crop_size
+            pad_h = max(0, ch - height)
+            pad_w = max(0, cw - width)
+            if pad_h > 0 or pad_w > 0:
+                pad = (0, pad_w, 0, pad_h)
+                sample["image"] = F.pad(sample["image"], pad, mode="reflect")
+                sample["density"] = F.pad(sample["density"], pad, mode="constant", value=0.0)
+                sample["mask"] = F.pad(sample["mask"], pad, mode="constant", value=0.0)
+                if "original_image" in sample:
+                    sample["original_image"] = F.pad(
+                        sample["original_image"], pad, mode="reflect"
+                    )
+                height += pad_h
+                width += pad_w
+
+        if self.density_biased_crops and self.fixed_crop_size is not None:
+            # Biased sampling applies to ALL variants (corners + randoms). This is the
+            # point: on datasets with concentrated crowds and large empty margins,
+            # uniformly-placed corner tiles are ~empty most of the time. Mirror / flip
+            # is still applied downstream via the existing ``decode_variant_index``
+            # logic, so we keep diversity via flip and the multinomial sampler.
+            crop_h, crop_w = self.fixed_crop_size
+            crop_h = max(1, min(height, crop_h))
+            crop_w = max(1, min(width, crop_w))
+            density_hw = sample["density"]
+            if density_hw.ndim == 3:
+                density_hw = density_hw.squeeze(0)
+            top, left = _density_biased_top_left(
+                density_hw,
+                crop_h,
+                crop_w,
+                uniform_eps=self.density_bias_uniform_eps,
+                baseline_frac=self.density_bias_baseline,
+            )
+        else:
+            top, left, crop_h, crop_w = self._crop_params(
+                base_idx,
+                crop_variant,
+                height,
+                width,
+            )
         sample = crop_sample(sample, top=top, left=left, crop_h=crop_h, crop_w=crop_w)
 
         if flip:
@@ -1065,14 +1227,14 @@ def visualize_image_and_density(
     # Row 2
     ax_den = axes[1, 1]
     im = ax_den.imshow(density, cmap=density_cmap)
-    if hmask is not None:
-        ax_den.contour(
-            hmask,
-            levels=[0.5],
-            colors="white",
-            linewidths=1.1,
-            alpha=0.95,
-        )
+    # if hmask is not None:
+    #     ax_den.contour(
+    #         hmask,
+    #         levels=[0.5],
+    #         colors="white",
+    #         linewidths=1.1,
+    #         alpha=0.95,
+    #     )
     ax_den.set_title(
         f"GT density"
         + (

@@ -48,7 +48,7 @@ class ViTDensity(nn.Module):
             encoder_name,
             pretrained=pretrained,
             num_classes=0,
-            # dynamic_img_size=True,
+            dynamic_img_size=True,
         )
         self.patch_size = self.encoder.patch_embed.patch_size[0]
         self.embed_dim = self.encoder.embed_dim
@@ -74,7 +74,7 @@ class ViTDensity(nn.Module):
         pad_h = (p - H % p) % p
         pad_w = (p - W % p) % p
         if pad_h or pad_w:
-            print(f"warning: padding input image to be divisible by {p}")
+            # print(f"warning: padding input image to be divisible by {p}")
             x = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
         H_pad, W_pad = x.shape[-2:]
 

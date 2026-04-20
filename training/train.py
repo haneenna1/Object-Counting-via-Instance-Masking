@@ -269,7 +269,7 @@ def compute_loss(
         else:
             count_loss = F.l1_loss(pred_count, gt_count)
 
-        return density_loss + count_loss_weight * count_loss
+        return density_loss + count_loss_weight * count_loss, density_loss
 
     # -----------------------------
     # inpaint mask handling
@@ -441,6 +441,96 @@ def train_one_epoch(
 
 
 # -----------------------------
+# Tiled inference
+# -----------------------------
+def _pad_to_tileable(dim: int, tile_size: int, stride: int) -> int:
+    """Smallest ``T >= max(dim, tile_size)`` such that ``(T - tile_size) % stride == 0``."""
+    if dim <= tile_size:
+        return tile_size
+    excess = (dim - tile_size) % stride
+    return dim + ((stride - excess) % stride)
+
+
+@torch.no_grad()
+def predict_tiled(
+    model: torch.nn.Module,
+    image: torch.Tensor,
+    tile_size: int = 224,
+    overlap: int = 48,
+    max_batch: int = 16,
+) -> torch.Tensor:
+    """
+    Sliding-window prediction with Hann-window blending.
+
+    Splits ``image`` (C, H, W) into overlapping ``tile_size x tile_size`` tiles with
+    stride ``tile_size - overlap``, runs them through ``model`` in batches of up to
+    ``max_batch``, and stitches the outputs using a 2D Hann window. The returned density
+    has the same spatial size ``(H, W)`` as ``image``.
+
+    Count preservation: each pixel's output is a window-weighted average of all tile
+    predictions covering it, so ``out.sum()`` is the sum of per-tile predictions
+    weighted by ``window / total_window`` -- same as summing non-overlapping predictions
+    in expectation. Combined with non-zero ``clamp_min`` on the windows, edge pixels
+    covered by only one tile get that tile's value unchanged.
+
+    Use this at val time so the ViT sees tiles at the **exact** resolution it was
+    trained on, instead of a huge ``dynamic_img_size`` interpolation of positional
+    embeddings to the full image resolution.
+    """
+    if image.ndim != 3:
+        raise ValueError(f"predict_tiled expects (C,H,W), got {tuple(image.shape)}")
+    C, H, W = image.shape
+    device = image.device
+    if tile_size <= 0 or overlap < 0 or overlap >= tile_size:
+        raise ValueError(
+            f"Require tile_size > overlap >= 0, got tile_size={tile_size}, overlap={overlap}"
+        )
+    stride = tile_size - overlap
+
+    Hp = _pad_to_tileable(H, tile_size, stride)
+    Wp = _pad_to_tileable(W, tile_size, stride)
+    pad_bottom = Hp - H
+    pad_right = Wp - W
+    if pad_bottom > 0 or pad_right > 0:
+        # Reflect-pad requires pad < dim along each axis; fall back to zero-pad
+        # for pathologically small images (much smaller than a tile).
+        mode = "reflect" if (pad_bottom < H and pad_right < W) else "constant"
+        img = F.pad(image.unsqueeze(0), (0, pad_right, 0, pad_bottom), mode=mode).squeeze(0)
+    else:
+        img = image
+
+    # Enumerate tile top-left positions.
+    coords: list[tuple[int, int]] = []
+    for top in range(0, Hp - tile_size + 1, stride):
+        for left in range(0, Wp - tile_size + 1, stride):
+            coords.append((top, left))
+
+    # 2D Hann window. ``clamp_min`` keeps pixels covered by only one tile well-defined.
+    wh = torch.hann_window(tile_size, periodic=False, device=device, dtype=torch.float32)
+    ww = torch.hann_window(tile_size, periodic=False, device=device, dtype=torch.float32)
+    window = (wh[:, None] * ww[None, :]).clamp_min(1e-3)
+
+    # Accumulators in float32 to avoid bf16/fp16 rounding on long sums.
+    out_sum = torch.zeros(1, Hp, Wp, device=device, dtype=torch.float32)
+    w_sum = torch.zeros(1, Hp, Wp, device=device, dtype=torch.float32)
+
+    for start in range(0, len(coords), max_batch):
+        chunk = coords[start : start + max_batch]
+        batch = torch.stack(
+            [img[:, t : t + tile_size, l : l + tile_size] for (t, l) in chunk],
+            dim=0,
+        )
+        pred = model(batch)  # (N, 1, tile, tile)
+        pred = pred[:, 0].float()  # (N, tile, tile)
+        for k, (t, l) in enumerate(chunk):
+            out_sum[0, t : t + tile_size, l : l + tile_size] += pred[k] * window
+            w_sum[0, t : t + tile_size, l : l + tile_size] += window
+
+    out = (out_sum / w_sum)[:, :H, :W]
+    return out.unsqueeze(0)  # (1, 1, H, W)
+
+
+# -----------------------------
 # Validation
 # -----------------------------
 @torch.no_grad()
@@ -450,7 +540,22 @@ def validate(
     device,
     density_scale: float = DEFAULT_DENSITY_SCALE,
     gt_downsample: str = "bilinear",
+    tiled: bool = False,
+    tile_size: int = 224,
+    tile_overlap: int = 48,
+    tile_max_batch: int = 16,
 ):
+    """
+    Per-image MAE on counts.
+
+    If ``tiled=True``, predictions are produced by :func:`predict_tiled` at the image's
+    native resolution. This matches the training-time tile size exactly and removes
+    the attention-length shift introduced by feeding full images to a model that was
+    trained on smaller crops.
+
+    Tiled mode requires dataloader batches of size 1 (every val image has a different
+    native shape). The non-tiled path still supports batched eval with same-shape images.
+    """
 
     model.eval()
 
@@ -462,7 +567,20 @@ def validate(
         images = batch["image"].to(device)
         gt_density = batch["density"].to(device)
 
-        pred_density = model(images)
+        if tiled:
+            if images.size(0) != 1:
+                raise RuntimeError(
+                    f"tiled validation requires val batch size 1, got {images.size(0)}."
+                )
+            pred_density = predict_tiled(
+                model,
+                images[0],
+                tile_size=tile_size,
+                overlap=tile_overlap,
+                max_batch=tile_max_batch,
+            )
+        else:
+            pred_density = model(images)
 
         pred_count, gt_count = _counts_from_densities(
             pred_density, gt_density, density_scale, gt_downsample=gt_downsample
@@ -532,6 +650,11 @@ def train(
     max_grad_norm: float | None = 1.0,
     resume_checkpoint: str | Path | None = None,
     log_dir: str | Path | None = None,
+    val_batch_size: int | None = None,
+    tiled_val: bool = False,
+    tiled_val_tile: int = 224,
+    tiled_val_overlap: int = 48,
+    tiled_val_max_batch: int = 16,
 ):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -574,7 +697,7 @@ def train(
             num_workers=8,
             pin_memory=True,
         )
-        val_batch_size=1
+        default_val_batch_size = 1
     else:
         train_loader = DataLoader(
             train_dataset,
@@ -584,7 +707,12 @@ def train(
             # persistent_workers=True,
             pin_memory=True,
         )
-        val_batch_size=batch_size
+        default_val_batch_size = batch_size
+
+    # Caller can force a smaller val batch (e.g. native-resolution ViT eval where every
+    # image has a different shape, so batching is not possible).
+    if val_batch_size is None:
+        val_batch_size = default_val_batch_size
 
     val_loader = None
     if validate_during_training:
@@ -658,6 +786,7 @@ def train(
     history: dict = {
         "train_loss": [],
         "train_mae": [],
+        "train_mse": [],
         "val_mae": [],
     }
     backbone_unfreeze_done = False
@@ -775,6 +904,10 @@ def train(
                 device,
                 density_scale=density_scale,
                 gt_downsample=gt_downsample,
+                tiled=tiled_val,
+                tile_size=tiled_val_tile,
+                tile_overlap=tiled_val_overlap,
+                tile_max_batch=tiled_val_max_batch,
             )
 
         uniq_lrs = sorted({g["lr"] for g in optimizer.param_groups}, reverse=True)

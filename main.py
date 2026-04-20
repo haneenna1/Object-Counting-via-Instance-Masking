@@ -29,6 +29,7 @@ from data.transforms import (
     normalize_imagenet_transform,
     timm_eval_dict_transform,
     timm_train_dict_transform,
+    vit_normalize_only_transform,
     compose_transforms,
 )
 from model.unet import UNetDensity
@@ -180,6 +181,75 @@ def parse_args() -> argparse.Namespace:
         help="ViT train: use timm-style RandomResizedCrop+ColorJitter (stronger than default).",
     )
     parser.add_argument(
+        "--vit-native-resolution",
+        action="store_true",
+        help="ViT only: train on fixed-pixel-size random crops (default 224x224) at the "
+        "image's native resolution (no resize), and validate on full images at native "
+        "resolution. Removes the train/val distribution shift that the default "
+        "scale-fraction crop + 224x224 resize pipeline introduces. Forces val batch "
+        "size = 1.",
+    )
+    parser.add_argument(
+        "--vit-native-crop",
+        type=int,
+        default=224,
+        help="Pixel size of the fixed square crop used by --vit-native-resolution. "
+        "Must be a multiple of the ViT patch size (16 for vit_*_patch16_*).",
+    )
+    parser.add_argument(
+        "--density-biased-crops",
+        action="store_true",
+        help="Sample training crop positions with probability proportional to the "
+        "density mass inside the window, instead of uniformly. Requires a fixed-pixel "
+        "crop (e.g. --vit-native-resolution). Avoids the 'mostly-empty crops' bias on "
+        "concentrated-crowd datasets like ShanghaiTech part_A.",
+    )
+    parser.add_argument(
+        "--density-bias-uniform-eps",
+        type=float,
+        default=0.1,
+        help="Mixing weight on uniform fallback inside density-biased sampling "
+        "(default 0.1 = 10%% of crops are still uniform so the model keeps seeing "
+        "pure-background examples).",
+    )
+    parser.add_argument(
+        "--density-bias-baseline",
+        type=float,
+        default=0.05,
+        help="Additive uniform prior on the window-mass map, as a fraction of its max "
+        "(default 0.05). Keeps low-density regions reachable by the multinomial.",
+    )
+    parser.add_argument(
+        "--tiled-val",
+        action="store_true",
+        help="Validate with sliding-window tiled inference at native image resolution. "
+        "Tiles are the same size as the training crop, so the ViT sees the exact "
+        "input size (and attention length) it was trained on -- fixes the "
+        "attention-length shift that --vit-native-resolution alone leaves in place "
+        "for ShanghaiTech-scale full images. Requires --vit-native-resolution.",
+    )
+    parser.add_argument(
+        "--tiled-val-tile",
+        type=int,
+        default=None,
+        help="Tile size (pixels) for --tiled-val. Defaults to --vit-native-crop. "
+        "Must be a multiple of the ViT patch size.",
+    )
+    parser.add_argument(
+        "--tiled-val-overlap",
+        type=int,
+        default=48,
+        help="Overlap (pixels) between adjacent tiles in --tiled-val (default 48). "
+        "Should be >= ~3 sigma of the density-map Gaussians to avoid seam artifacts.",
+    )
+    parser.add_argument(
+        "--tiled-val-max-batch",
+        type=int,
+        default=16,
+        help="Max number of tiles forwarded at once per val image in --tiled-val. "
+        "Lower this if you OOM on big images.",
+    )
+    parser.add_argument(
         "--optimizer",
         type=str,
         default="sgd",
@@ -298,13 +368,54 @@ if __name__ == "__main__":
 
     train_transform = None
     eval_transform = None
+    if args.tiled_val and args.model != "vit":
+        raise ValueError("--tiled-val is only supported for --model vit.")
     if args.model == "vit":
-        # Transforms from timm ``resolve_model_data_config(encoder)`` (same as ``create_transform``).
-        eval_transform = timm_eval_dict_transform(model.encoder)
-        train_transform = timm_train_dict_transform(
-            model.encoder,
-            mode="full" if args.vit_full_timm_aug else "light",
-        )
+        if args.vit_native_resolution:
+            # Native-resolution recipe: train on fixed-pixel crops, validate on full images.
+            # Train and val both see images at the same heads-per-pixel statistics.
+            patch = model.patch_size
+            if args.vit_native_crop % patch != 0:
+                raise ValueError(
+                    f"--vit-native-crop={args.vit_native_crop} must be a multiple of the ViT "
+                    f"patch size ({patch})."
+                )
+            print(
+                f"ViT native-resolution mode: train crops {args.vit_native_crop}x"
+                f"{args.vit_native_crop} at native res, val at full image resolution."
+            )
+            train_transform = vit_normalize_only_transform(model.encoder)
+            eval_transform = vit_normalize_only_transform(model.encoder)
+            if args.tiled_val:
+                tile = args.tiled_val_tile if args.tiled_val_tile is not None else args.vit_native_crop
+                if tile % patch != 0:
+                    raise ValueError(
+                        f"--tiled-val-tile={tile} must be a multiple of the ViT patch "
+                        f"size ({patch})."
+                    )
+                if args.tiled_val_overlap < 0 or args.tiled_val_overlap >= tile:
+                    raise ValueError(
+                        f"--tiled-val-overlap={args.tiled_val_overlap} must satisfy "
+                        f"0 <= overlap < tile ({tile})."
+                    )
+                print(
+                    f"Tiled validation: tile={tile}, overlap={args.tiled_val_overlap}, "
+                    f"max_batch={args.tiled_val_max_batch}."
+                )
+        else:
+            if args.tiled_val:
+                raise ValueError(
+                    "--tiled-val requires --vit-native-resolution so val images are fed "
+                    "at native resolution (batch size 1, no resize/center-crop)."
+                )
+            # Default: timm resize+center-crop pipeline (ViT pretraining-style 224x224).
+            # Note: this introduces a train/val distribution shift on dense crowd datasets
+            # because the train side also crops fractional windows that get resized to 224.
+            eval_transform = timm_eval_dict_transform(model.encoder)
+            train_transform = timm_train_dict_transform(
+                model.encoder,
+                mode="full" if args.vit_full_timm_aug else "light",
+            )
 
     dataset_kwargs = dict(
         root="./ShanghaiTech",
@@ -352,15 +463,34 @@ if __name__ == "__main__":
         )
         val_dataset = train_dataset
     else:
-        train_dataset = PatchAugmentedDataset(
-            train_full_dataset,
-            random_crops_per_image=3,
-            fixed_patch_scale=0.5,   # corners: quarter-area style
-            random_patch_scale=0.75,  # randoms: larger windows
-            mirror=True,
-            transform=train_transform,
-        )
-        #   train_dataset = train_full_dataset
+        # In native-resolution mode the cropping happens at native pixel size (no resize),
+        # so heads/pixel is preserved. Otherwise we keep the legacy fractional-scale crops.
+        if args.model == "vit" and args.vit_native_resolution:
+            patch_kwargs = dict(
+                random_crops_per_image=3,
+                fixed_patch_scale=0.5,   # ignored when fixed_crop_size is set
+                random_patch_scale=0.75,  # ignored when fixed_crop_size is set
+                mirror=True,
+                transform=train_transform,
+                fixed_crop_size=(args.vit_native_crop, args.vit_native_crop),
+                density_biased_crops=args.density_biased_crops,
+                density_bias_uniform_eps=args.density_bias_uniform_eps,
+                density_bias_baseline=args.density_bias_baseline,
+            )
+        else:
+            if args.density_biased_crops:
+                raise ValueError(
+                    "--density-biased-crops requires a fixed-pixel crop. Pass "
+                    "--vit-native-resolution (ViT) or remove --density-biased-crops."
+                )
+            patch_kwargs = dict(
+                random_crops_per_image=3,
+                fixed_patch_scale=0.5,
+                random_patch_scale=0.75,
+                mirror=True,
+                transform=train_transform,
+            )
+        train_dataset = PatchAugmentedDataset(train_full_dataset, **patch_kwargs)
         val_dataset = load_shanghaitech_dataset(
             **dataset_kwargs,
             split="test_data",
@@ -403,6 +533,18 @@ if __name__ == "__main__":
     if args.model == "csrnet":
         train_kw["gt_downsample"] = "csrnet_cubic"
         train_kw["density_scale"] = 1.0
+
+    if args.model == "vit" and args.vit_native_resolution:
+        # Each val image keeps its native shape, so they cannot be batched together.
+        train_kw["val_batch_size"] = 1
+
+    if args.tiled_val:
+        train_kw["tiled_val"] = True
+        train_kw["tiled_val_tile"] = (
+            args.tiled_val_tile if args.tiled_val_tile is not None else args.vit_native_crop
+        )
+        train_kw["tiled_val_overlap"] = args.tiled_val_overlap
+        train_kw["tiled_val_max_batch"] = args.tiled_val_max_batch
 
     train(model, train_dataset, val_dataset, **train_kw)
 

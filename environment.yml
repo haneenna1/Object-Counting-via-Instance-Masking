@@ -40,3 +40,4 @@ dependencies:
       - albumentations
       - kagglehub
       - timm
+      - umap-learn

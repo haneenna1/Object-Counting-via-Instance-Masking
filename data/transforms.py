@@ -467,6 +467,36 @@ def _rrc_interpolation_to_tv(rrc) -> TVInterpolationMode:
         raise NotImplementedError(f"Unsupported RRC interpolation {s!r}")
     return mapping[s]
 
+def vit_normalize_only_transform(timm_model):
+    """
+    Normalize ``sample['image']`` with the encoder's expected mean/std and **do nothing
+    spatial** to image, density, or mask.
+
+    Use this with native-resolution training/validation: the model receives the image at
+    its true resolution (no resize, no center-crop), so heads/pixel and heads/ViT-token
+    are preserved end-to-end. Pair with ``ViTDensity(dynamic_img_size=True)`` (default) on
+    the model side and a fixed-size random-crop dataset on the train side.
+
+    Validation with this transform requires ``batch_size=1`` because images have
+    different native sizes.
+    """
+    import timm.data as tdata
+
+    cfg = tdata.resolve_model_data_config(timm_model)
+    mean = torch.tensor(cfg["mean"], dtype=torch.float32).view(3, 1, 1)
+    std = torch.tensor(cfg["std"], dtype=torch.float32).view(3, 1, 1)
+
+    def _transform(sample):
+        s = dict(sample)
+        img = s["image"]
+        m = mean.to(device=img.device, dtype=img.dtype)
+        sd = std.to(device=img.device, dtype=img.dtype)
+        s["image"] = (img - m) / sd
+        return s
+
+    return _transform
+
+
 def timm_eval_dict_transform(timm_model):
     """
     Sample dict transform using ``timm.data.create_transform(..., is_training=False)`` for
