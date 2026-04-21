@@ -44,39 +44,56 @@ def _mask_from_dots(shape, points, params) -> np.ndarray:
     aspect_hw: Tuple[int, int] = params.get("dot_box_aspect", (1, 1))
 
     mask = np.zeros((H, W), dtype=np.uint8)
+    n = len(points)
+    if n == 0:
+        return mask
 
-    for i, (x, y) in enumerate(points):
-        if box_size is None:
-            if per_sigmas is not None:
-                s = float(per_sigmas[i])
-            else:
-                s = float(sigma)
-            scale = float(sigma_to_box * s)
-            box_h, box_w = _box_hw_from_scale(scale, aspect_hw)
-        elif isinstance(box_size, int):
-            box_h, box_w = _box_hw_from_scale(float(box_size), aspect_hw)
+    # Precompute integer pixel coords of every dot once (was recomputed
+    # inside an O(N^2) Python loop per image before).
+    pts_arr = np.asarray(points, dtype=np.float64)
+    ix_all = np.rint(pts_arr[:, 0]).astype(np.int64)
+    iy_all = np.rint(pts_arr[:, 1]).astype(np.int64)
+
+    # Precompute (box_h, box_w) per dot so the inner loop is minimal.
+    if box_size is None:
+        if per_sigmas is not None:
+            per_s = np.asarray(per_sigmas, dtype=np.float64)
         else:
-            box_h, box_w = box_size
+            per_s = np.full(n, float(sigma), dtype=np.float64)
+        scales = sigma_to_box * per_s
+        box_hw = [_box_hw_from_scale(float(s), aspect_hw) for s in scales]
+    elif isinstance(box_size, int):
+        bh, bw = _box_hw_from_scale(float(box_size), aspect_hw)
+        box_hw = [(bh, bw)] * n
+    else:
+        bh, bw = int(box_size[0]), int(box_size[1])
+        box_hw = [(bh, bw)] * n
 
+    for i in range(n):
+        box_h, box_w = box_hw[i]
         half_w = box_w // 2
-        ix, iy = int(round(x)), int(round(y))
+        ix = int(ix_all[i])
+        iy = int(iy_all[i])
 
-        y1 = max(0, iy-half_w)
-        y2 = min(H, iy -half_w + box_h)
-
+        y1 = max(0, iy - half_w)
+        y2 = min(H, iy - half_w + box_h)
         x1 = max(0, ix - half_w)
         x2 = min(W, ix - half_w + box_w)
 
-        # Clip y2 so the box stops before any other dot below this one
-        for j, (xj, yj) in enumerate(points):
-            if j == i:
-                continue
-            jx, jy = int(round(xj)), int(round(yj))
-            if  y1<=jy<y2 and x1<=jx<x2:
-                y2 = jy
-                # print(f"Clipped y2 from {y2} to {jy}")
+        # Clip y2 so the box stops before any other dot below this one.
+        # Vectorized across all points (excluding self) instead of a Python loop.
+        # The original loop monotonically reduces y2 down to the minimum jy
+        # satisfying the bounds, so we compute that minimum directly.
+        if y2 > y1 and x2 > x1:
+            in_range = (
+                (iy_all >= y1) & (iy_all < y2) & (ix_all >= x1) & (ix_all < x2)
+            )
+            in_range[i] = False
+            if in_range.any():
+                y2 = int(iy_all[in_range].min())
 
-        mask[y1:y2, x1:x2] = 1
+            if y2 > y1:
+                mask[y1:y2, x1:x2] = 1
 
     return mask
 
@@ -110,35 +127,72 @@ def _mask_from_dots_gaussian_footprint(
         raise ValueError(
             f"sigmas length {sigmas.shape[0]} != len(all_points) {len(all_points)}"
         )
-    masked_set = frozenset(int(j) for j in masked_indices.ravel())
-    for i in masked_indices:
-        i = int(i)
-        s = float(sigmas[i])
-        r = max(1, int(np.ceil(truncate_sigma * s)))
-        if clip_disks:
-            for j in range(n):
-                if j == i:
-                    continue
-                dx = float(pts[i, 0] - pts[j, 0])
-                dy = float(pts[i, 1] - pts[j, 1])
-                d = float(np.hypot(dx, dy))
-                if d <= 0.0:
-                    continue
-                if j in masked_set:
-                    r = min(r, max(0, int(np.floor(0.5 * d - 1e-6))))
-                else:
-                    r = min(r, max(0, int(np.floor(d - 1e-6))))
+
+    masked_idx = np.asarray(masked_indices, dtype=np.int64).ravel()
+    m = masked_idx.size
+
+    # Initial per-disk radii before clipping: max(1, ceil(truncate_sigma * sigma_i))
+    sigmas_m = np.asarray(sigmas, dtype=np.float64)[masked_idx]
+    radii = np.maximum(1, np.ceil(truncate_sigma * sigmas_m).astype(np.int64))
+
+    if clip_disks and n > 1:
+        # Vectorize the O(m * n) Python loop: compute pairwise distances
+        # between masked points and all points, then reduce. This replaces
+        # ~m*n scalar hypot / floor calls per image with a single numpy op.
+        pm = pts[masked_idx]  # (m, 2)
+        dx = pm[:, 0:1] - pts[None, :, 0]  # (m, n)
+        dy = pm[:, 1:2] - pts[None, :, 1]  # (m, n)
+        d = np.hypot(dx, dy)  # (m, n)
+
+        # Exclude self-comparisons and coincident points (original: `if d <= 0: continue`).
+        # Any pair with d == 0 is treated as "skip", including i == j.
+        valid = d > 0.0
+        d_valid = np.where(valid, d, np.inf)
+
+        # Split neighbors into masked / unmasked columns.
+        is_masked_col = np.zeros(n, dtype=bool)
+        is_masked_col[masked_idx] = True
+
+        eps = 1e-6
+        d_to_masked = np.where(is_masked_col[None, :], d_valid, np.inf)
+        d_to_unmasked = np.where(~is_masked_col[None, :], d_valid, np.inf)
+
+        min_to_masked = d_to_masked.min(axis=1)  # (m,)
+        min_to_unmasked = d_to_unmasked.min(axis=1)  # (m,)
+
+        # Matches original: r = min(r, max(0, floor(0.5 * d - eps))) for masked j,
+        #                   r = min(r, max(0, floor(d - eps)))       for unmasked j.
+        cap_m = np.where(
+            np.isfinite(min_to_masked),
+            np.maximum(0.0, np.floor(0.5 * min_to_masked - eps)),
+            np.inf,
+        )
+        cap_u = np.where(
+            np.isfinite(min_to_unmasked),
+            np.maximum(0.0, np.floor(min_to_unmasked - eps)),
+            np.inf,
+        )
+        combined_cap = np.minimum(cap_m, cap_u)
+        # combined_cap may be inf (no neighbors); np.minimum(finite_int, inf) stays finite.
+        radii = np.minimum(radii.astype(np.float64), combined_cap).astype(np.int64)
+
+    # Rasterize disks (kept as a Python loop; hot path was the O(N^2) clipping above).
+    ix_all = np.rint(pts[:, 0]).astype(np.int64)
+    iy_all = np.rint(pts[:, 1]).astype(np.int64)
+    for k in range(m):
+        r = int(radii[k])
         if r < 1:
             continue
-        ix = int(round(float(pts[i, 0])))
-        iy = int(round(float(pts[i, 1])))
+        i = int(masked_idx[k])
+        ix = int(ix_all[i])
+        iy = int(iy_all[i])
         y0, y1 = max(0, iy - r), min(H, iy + r + 1)
         x0, x1 = max(0, ix - r), min(W, ix + r + 1)
         if y0 >= y1 or x0 >= x1:
             continue
         yy, xx = np.ogrid[y0:y1, x0:x1]
         disk = (yy - iy) ** 2 + (xx - ix) ** 2 <= r * r
-        mask[y0:y1, x0:x1] = np.maximum(mask[y0:y1, x0:x1], disk.astype(np.uint8))
+        np.bitwise_or(mask[y0:y1, x0:x1], disk.view(np.uint8), out=mask[y0:y1, x0:x1])
 
     return mask
 
