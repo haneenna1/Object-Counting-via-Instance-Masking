@@ -202,37 +202,13 @@ class CountWeightController:
 # -----------------------------
 # Loss: density MSE + choice of count loss (MAE or MSE on count)
 # -----------------------------
-def compute_loss(
-    pred_density,
-    gt_density,
-    count_loss_weight: float = 1.0,
-    invisible_density_weight: float = 1.0,
-    invisible_count_weight: float = 1.0,
-    loss_mode: str = "density_mse_count_l1",
-    density_scale: float = DEFAULT_DENSITY_SCALE,
-    gt_downsample: str = "bilinear",
-    mask: torch.Tensor = None,
-    mask_mode: str = "robust",
-    eps: float = 1e-6,
-):
-    """
-    Density + count loss with explicit visible / invisible supervision.
-
-    Key features:
-    - Area-correct density resizing
-    - Mask-aware density MSE (normalized)
-    - Region-normalized count loss (prevents bias from mask size)
-    - Separate weighting for invisible regions
-    """
-
+def _gt_density_resize(gt_density, pred_density, gt_downsample, density_scale):
     if gt_downsample not in ("bilinear", "csrnet_cubic"):
-        raise ValueError(f"gt_downsample must be 'bilinear' or 'csrnet_cubic', got {gt_downsample!r}")
-
+        raise ValueError(
+            f"gt_downsample must be 'bilinear' or 'csrnet_cubic', got {gt_downsample!r}"
+        )
     H_pred, W_pred = pred_density.shape[-2:]
 
-    # -----------------------------
-    # Resize GT density (preserve count)
-    # -----------------------------
     if pred_density.shape[-2:] != gt_density.shape[-2:]:
         if gt_downsample == "csrnet_cubic":
             gt_resized = downsample_gt_csrnet_cubic(gt_density, H_pred, W_pred)
@@ -246,42 +222,69 @@ def compute_loss(
                 mode="bilinear",
                 align_corners=False,
             )
-            scale_h = H_gt / H_pred
-            scale_w = W_gt / W_pred
-            gt_resized = gt_resized * (scale_h * scale_w)
+            spatial_scale = (H_gt / H_pred) * (W_gt / W_pred)
+            gt_resized = gt_resized * spatial_scale
             gt_for_count = gt_resized
             gt_target = gt_resized * density_scale
     else:
         gt_for_count = gt_density
         gt_target = gt_density * density_scale
 
+    return gt_for_count, gt_target
+
+def compute_loss(
+    pred_density,
+    gt_density,
+    count_loss_weight: float = 1.0,
+    invisible_density_weight: float = 1.0,
+    invisible_count_weight: float = 1.0,
+    loss_mode: str = "density_mse_count_l1",
+    density_scale: float = DEFAULT_DENSITY_SCALE,
+    gt_downsample: str = "bilinear",
+    mask: torch.Tensor | None = None,
+    mask_mode: str = "robust",  # retained for API compat; no longer branched on
+    eps: float = 1e-6,
+):
+    """
+    Unified density + count loss with visible / invisible supervision.
+    Density term
+        Per-pixel MSE inside each region, normalized by that region's pixel
+        count (area-invariant), then combined as:
+            L_dens = mean_batch( vis_mse + w_inv_den * inv_mse )
+        Pixel normalization is correct here because a sum of squared errors
+        scales linearly with the number of pixels summed over.
+    Count term (pixel-normalization bug fixed)
+        Counts are scalars in units of "heads", not "heads per pixel", so we
+        do NOT divide by region pixel count. We use relative (per-head)
+        normalization with clamp_min(1.0):
+            |dC_r| / max(GT_count_r, 1)
+        - In inpaint mode (GT_inv > 0) this is the relative miscount rate
+          for hidden heads -- commensurable with the visible rate.
+        - In robust mode (GT_inv == 0 by construction, because the dataset
+          zeros GT density inside the mask) this collapses safely to
+          |Σpred_inv|, which correctly penalizes any predicted density
+          inside the masked region (pushes pred -> 0 there).
+    No-mask case (``mask is None`` or all-zero)
+        Invisible region has zero area, both invisible terms collapse to
+        zero, and the loss reduces to visible density MSE + visible count
+        L1/L2 -- behaviorally equivalent to the previous no-mask branch.
+    """
+
     # -----------------------------
-    # visible objects only case (standard loss)
+    # Resize GT density (preserve count)
     # -----------------------------
-    if mask is None or not mask.any() or mask_mode == "robust":
-        density_loss = F.mse_loss(pred_density, gt_target)
+    gt_for_count, gt_target = _gt_density_resize(gt_density, pred_density, gt_downsample, density_scale)
 
-        pred_count = pred_density.sum(dim=(1, 2, 3)) / density_scale
-        gt_count = gt_for_count.sum(dim=(1, 2, 3))
-
-        if loss_mode == "density_mse_count_mse":
-            count_loss = F.mse_loss(pred_count, gt_count)
-        else:
-            count_loss = F.l1_loss(pred_count, gt_count)
-
-        return density_loss + count_loss_weight * count_loss, density_loss
-
-    # -----------------------------
-    # inpaint mask handling
-    # -----------------------------
-    if mask.shape[-2:] != pred_density.shape[-2:]:
-        mask = F.interpolate(mask, size=pred_density.shape[-2:], mode="nearest")
-
-    mask = mask.clamp(0.0, 1.0)
+    if mask is None:
+        mask = torch.zeros_like(pred_density)
+    else:
+        if mask.shape[-2:] != pred_density.shape[-2:]:
+            mask = F.interpolate(mask, size=pred_density.shape[-2:], mode="nearest")
+        mask = mask.clamp(0.0, 1.0)
     vis_mask = 1.0 - mask
 
     # -----------------------------
-    # Density loss (region-normalized)
+    # Density loss (region-normalized by pixels; correct for summed MSE)
     # -----------------------------
     sq_err = (pred_density - gt_target) ** 2
 
@@ -291,21 +294,20 @@ def compute_loss(
     vis_pix = vis_mask.sum(dim=(1, 2, 3)).clamp_min(eps)
     inv_pix = mask.sum(dim=(1, 2, 3)).clamp_min(eps)
 
-    inv_w_den = float(invisible_density_weight)
-
+    # When a region is empty (e.g. no mask), its sq_err contribution is also 0,
+    # so the /eps guard is harmless (0 / eps == 0).
     density_loss = (
-        (vis_err / vis_pix) +
-        inv_w_den * (inv_err / inv_pix)
+        (vis_err / vis_pix)
+        + float(invisible_density_weight) * (inv_err / inv_pix)
     ).mean()
 
     # -----------------------------
-    # Count loss (region-normalized)
+    # Count loss (per-region; NO pixel normalization)
     # -----------------------------
     pred_raw = pred_density / density_scale
 
     pred_visible_count = (pred_raw * vis_mask).sum(dim=(1, 2, 3))
     pred_invisible_count = (pred_raw * mask).sum(dim=(1, 2, 3))
-
     gt_visible_count = (gt_for_count * vis_mask).sum(dim=(1, 2, 3))
     gt_invisible_count = (gt_for_count * mask).sum(dim=(1, 2, 3))
 
@@ -316,17 +318,13 @@ def compute_loss(
         vis_count_err = torch.abs(pred_visible_count - gt_visible_count)
         inv_count_err = torch.abs(pred_invisible_count - gt_invisible_count)
 
-    # Normalize by region size → critical fix
-    vis_count_err = vis_count_err / vis_pix
-    inv_count_err = inv_count_err / inv_pix
+    vis_count_err = vis_count_err / gt_visible_count.clamp_min(1.0)
+    inv_count_err = inv_count_err / gt_invisible_count.clamp_min(1.0)
 
-    inv_w_cnt = float(invisible_count_weight)
+    count_loss = (
+        vis_count_err + float(invisible_count_weight) * inv_count_err
+    ).mean()
 
-    count_loss = (vis_count_err + inv_w_cnt * inv_count_err).mean()
-
-    # -----------------------------
-    # Final loss
-    # -----------------------------
     return density_loss + count_loss_weight * count_loss, density_loss
 
 # -----------------------------

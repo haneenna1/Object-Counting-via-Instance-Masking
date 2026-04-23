@@ -38,6 +38,59 @@ from model.vit_density import ViTDensity
 from training.train import train, DEFAULT_DENSITY_SCALE
 
 
+def _load_vit_init_weights(
+    model: ViTDensity,
+    ckpt_path: str | Path,
+    mode: str = "full",
+    device: torch.device | str = "cpu",
+) -> None:
+    """Load ViT initialization checkpoint with optional backbone-only mode."""
+    path = Path(ckpt_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"ViT init checkpoint not found: {path}")
+
+    obj = torch.load(path, map_location=device)
+    if isinstance(obj, dict) and "model_state_dict" in obj:
+        state = obj["model_state_dict"]
+    elif isinstance(obj, dict):
+        state = obj
+    else:
+        raise ValueError(
+            f"Unsupported checkpoint format in {path}. Expected a state_dict or "
+            "a dict containing model_state_dict."
+        )
+
+    if mode == "full":
+        model.load_state_dict(state, strict=True)
+        print(f"Loaded full ViT checkpoint from {path}.")
+        return
+    if mode != "backbone":
+        raise ValueError(f"Unknown --vit-init-load-mode {mode!r}; use 'full' or 'backbone'.")
+
+    enc_prefix = "encoder."
+    enc_state = {
+        k[len(enc_prefix) :]: v
+        for k, v in state.items()
+        if k.startswith(enc_prefix)
+    }
+    if not enc_state:
+        raise ValueError(
+            f"No encoder weights found in {path}. Expected keys starting with '{enc_prefix}'."
+        )
+    missing, unexpected = model.encoder.load_state_dict(enc_state, strict=False)
+    if unexpected:
+        warnings.warn(
+            f"Unexpected encoder keys while loading backbone from {path}: {unexpected[:8]}",
+            stacklevel=1,
+        )
+    if missing:
+        warnings.warn(
+            f"Missing encoder keys while loading backbone from {path}: {missing[:8]}",
+            stacklevel=1,
+        )
+    print(f"Loaded ViT backbone only from {path}.")
+
+
 class _Tee:
     """Write to both a terminal stream and a log file."""
 
@@ -166,6 +219,12 @@ def parse_args() -> argparse.Namespace:
         "--freeze-encoder",
         action="store_true",
         help="Freeze the pretrained encoder (VGG for CSRNet, ViT for vit).",
+    )
+    parser.add_argument(
+        "--linear-probe",
+        action="store_true",
+        help="ViT only: train a strict linear probe head (1x1 on patch features) "
+        "on top of a frozen encoder.",
     )
     parser.add_argument(
         "--unfreeze-backbone-after-epoch",
@@ -297,6 +356,21 @@ def parse_args() -> argparse.Namespace:
         help="Path to a *-latest.pth file saved during training. Restores model, optimizer, "
         "LR scheduler, epoch, best MAE, early-stopping counter, and history when present in the file.",
     )
+    parser.add_argument(
+        "--vit-init-checkpoint",
+        type=str,
+        default="trained_models/vit/vit-shng-part_A-0.3-inpaint-gaussian-random/vit-shng-0.3-inpaint-gaussian-random-best.pth",
+        help="Optional checkpoint used to initialize ViT before training. "
+        "Set to empty string to disable explicit init checkpoint loading.",
+    )
+    parser.add_argument(
+        "--vit-init-load-mode",
+        type=str,
+        default="full",
+        choices=["full", "backbone"],
+        help="'full': load full ViTDensity state_dict. "
+        "'backbone': load only encoder.* weights (useful with --linear-probe).",
+    )
     return parser.parse_args()
 
 
@@ -319,6 +393,15 @@ if __name__ == "__main__":
             "only the decoder is trained.",
             stacklevel=1,
         )
+    if args.linear_probe and args.model != "vit":
+        raise ValueError("--linear-probe is only supported for --model vit.")
+    if args.linear_probe and not (args.freeze_encoder==True and args.unfreeze_backbone_after_epoch is None):
+        raise ValueError("--linear-probe requires --freeze-encoder and --unfreeze-backbone-after-epoch=None.")
+    if args.model == "vit" and args.linear_probe and args.vit_init_load_mode == "full":
+        # Linear probe changes decoder shape; full loading from a fine-tuned checkpoint
+        # usually fails on decoder keys, so default to backbone-only loading.
+        args.vit_init_load_mode = "backbone"
+        print("Linear probe detected: switching --vit-init-load-mode to 'backbone'.")
     # Build log path: <output_dir>/<run_tag>/train-<date>.log
     mask_str = "nomsk" if args.mask_ratio is None else f"{args.mask_ratio}-{args.mask_mode or 'inpaint'}"
     if args.mask_ratio is not None and args.mask_dot_style != "box":
@@ -361,7 +444,15 @@ if __name__ == "__main__":
             pretrained=True,
             freeze_encoder=args.freeze_encoder,
             output_activation="softplus",
+            linear_probe=args.linear_probe,
         )
+        if args.vit_init_checkpoint:
+            _load_vit_init_weights(
+                model,
+                args.vit_init_checkpoint,
+                mode=args.vit_init_load_mode,
+                device=device,
+            )
     else:
         raise ValueError(f"Unknown model {args.model!r}")
 

@@ -12,11 +12,12 @@ from tqdm import tqdm
 from data.dataset import visualize_image_and_density
 from data.dataset import DENSITY_MAP_DIR_AUTO
 from data.shanghaitech import load_shanghaitech_dataset
-from data.transforms import timm_eval_dict_transform
+# from data.transforms import timm_eval_dict_transform
+from data.transforms import vit_normalize_only_transform
 from model.csrnet import CSRNet, load_vgg16_frontend
 from model.unet import UNetDensity
 from model.vit_density import ViTDensity
-from training.train import DEFAULT_DENSITY_SCALE, downsample_gt_csrnet_cubic
+from training.train import DEFAULT_DENSITY_SCALE, downsample_gt_csrnet_cubic, predict_tiled
 
 
 def _resize_gt_density_to_prediction(
@@ -67,6 +68,10 @@ def evaluate_model_on_dataset(
     batch_size: int = 8,
     num_workers: int = 4,
     num_visualizations: int = 10,
+    tiled_eval: bool = False,
+    tile_size: int = 224,
+    tile_overlap: int = 48,
+    tile_max_batch: int = 16,
 ) -> dict[str, float | int | str | None]:
     """
     Evaluate a model on one dataset and persist outputs under inference/results:
@@ -107,7 +112,20 @@ def evaluate_model_on_dataset(
         if mask is not None:
             mask = mask.to(device)
 
-        pred_density = model(images)
+        if tiled_eval:
+            if images.size(0) != 1:
+                raise RuntimeError(
+                    f"tiled eval requires eval batch size 1, got {images.size(0)}."
+                )
+            pred_density = predict_tiled(
+                model,
+                images[0],
+                tile_size=tile_size,
+                overlap=tile_overlap,
+                max_batch=tile_max_batch,
+            )
+        else:
+            pred_density = model(images)
         gt_for_count = _resize_gt_density_to_prediction(
             gt_density=gt_density,
             pred_density=pred_density,
@@ -193,7 +211,8 @@ def _build_model(model_name: str, freeze_encoder: bool) -> torch.nn.Module:
 
 
 def _build_eval_dataset(args, model) -> tuple[object, str, float]:
-    eval_transform = timm_eval_dict_transform(model.encoder) if args.model == "vit" else None
+    # eval_transform = timm_eval_dict_transform(model.encoder) if args.model == "vit" else None
+    eval_transform = vit_normalize_only_transform(model.encoder)
     dataset = load_shanghaitech_dataset(
         root=args.data_root,
         part=[args.part],
@@ -229,10 +248,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deterministic-masks", action="store_true")
     parser.add_argument("--mask-seed", type=int, default=None)
     parser.add_argument("--freeze-encoder", action="store_true")
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--num-visualizations", type=int, default=10)
     parser.add_argument("--density-scale", type=float, default=DEFAULT_DENSITY_SCALE)
+    parser.add_argument("--tiled-eval", action="store_true")
+    parser.add_argument("--tile-size", type=int, default=224)
+    parser.add_argument("--tile-overlap", type=int, default=48)
+    parser.add_argument("--tile-max-batch", type=int, default=16)
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-root", type=str, default="inference/results")
     return parser.parse_args()
@@ -271,6 +294,10 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         num_visualizations=args.num_visualizations,
+        tiled_eval=args.tiled_eval,
+        tile_size=args.tile_size,
+        tile_overlap=args.tile_overlap,
+        tile_max_batch=args.tile_max_batch,
     )
     print(
         "Evaluation complete | "

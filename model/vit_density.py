@@ -38,6 +38,7 @@ class ViTDensity(nn.Module):
         pretrained: bool = True,
         freeze_encoder: bool = False,
         output_activation: str = "none",
+        linear_probe: bool = False,
     ):
         super().__init__()
         if output_activation not in ("relu", "softplus", "none"):
@@ -53,19 +54,24 @@ class ViTDensity(nn.Module):
         self.patch_size = self.encoder.patch_embed.patch_size[0]
         self.embed_dim = self.encoder.embed_dim
         self.num_prefix_tokens = getattr(self.encoder, "num_prefix_tokens", 1)
+        self.linear_probe = linear_probe
 
         if freeze_encoder:
             for p in self.encoder.parameters():
                 p.requires_grad = False
 
-        # 4 stages of 2x upsampling: 1/16 -> 1/8 -> 1/4 -> 1/2 -> 1/1
-        self.decoder = nn.Sequential(
-            _DecoderBlock(self.embed_dim, 256),
-            _DecoderBlock(256, 128),
-            _DecoderBlock(128, 64),
-            _DecoderBlock(64, 32),
-            nn.Conv2d(32, 1, kernel_size=1),
-        )
+        if self.linear_probe:
+            # Strict linear probe: one learned linear projection per patch.
+            self.decoder = nn.Conv2d(self.embed_dim, 1, kernel_size=1)
+        else:
+            # 4 stages of 2x upsampling: 1/16 -> 1/8 -> 1/4 -> 1/2 -> 1/1
+            self.decoder = nn.Sequential(
+                _DecoderBlock(self.embed_dim, 256),
+                _DecoderBlock(256, 128),
+                _DecoderBlock(128, 64),
+                _DecoderBlock(64, 32),
+                nn.Conv2d(32, 1, kernel_size=1),
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, _, H, W = x.shape
@@ -86,6 +92,13 @@ class ViTDensity(nn.Module):
         features = features.transpose(1, 2).reshape(B, self.embed_dim, h, w)
 
         density = self.decoder(features)
+        if self.linear_probe:
+            density = F.interpolate(
+                density,
+                size=(H_pad, W_pad),
+                mode="bilinear",
+                align_corners=False,
+            )
         density = density[:, :, :H, :W]
 
         if self._output_activation == "relu":
