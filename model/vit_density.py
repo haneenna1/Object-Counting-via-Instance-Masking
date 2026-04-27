@@ -73,6 +73,13 @@ class ViTDensity(nn.Module):
                 nn.Conv2d(32, 1, kernel_size=1),
             )
 
+        # B2: per-channel learnable mask fill. Used only when mask_fill='learnable'
+        # (see training.train.apply_mask_fill). Initialized at 0 so that at step 0
+        # the learnable mode exactly reproduces the ``imagenet_mean`` fill (i.e.
+        # 0 in normalized space). Registered always so loading/saving is stable
+        # regardless of the fill mode in use at train time.
+        self.mask_token = nn.Parameter(torch.zeros(3))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, _, H, W = x.shape
 

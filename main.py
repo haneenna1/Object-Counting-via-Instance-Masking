@@ -61,8 +61,23 @@ def _load_vit_init_weights(
         )
 
     if mode == "full":
-        model.load_state_dict(state, strict=True)
-        print(f"Loaded full ViT checkpoint from {path}.")
+        # Tolerate missing keys that were added after the checkpoint was saved
+        # (e.g. B2's ``mask_token``); fail loudly on unexpected keys.
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        ok_missing = {"mask_token"}
+        real_missing = [k for k in missing if k not in ok_missing]
+        if real_missing:
+            raise RuntimeError(
+                f"Missing keys while loading full ViT checkpoint from {path}: {real_missing[:8]}"
+            )
+        if unexpected:
+            raise RuntimeError(
+                f"Unexpected keys while loading full ViT checkpoint from {path}: {unexpected[:8]}"
+            )
+        if missing:
+            print(f"Loaded full ViT checkpoint from {path}; initialized {missing} from scratch.")
+        else:
+            print(f"Loaded full ViT checkpoint from {path}.")
         return
     if mode != "backbone":
         raise ValueError(f"Unknown --vit-init-load-mode {mode!r}; use 'full' or 'backbone'.")
@@ -138,8 +153,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--invisible-density-weight",
         type=float,
-        default=1.0,
-        help="Invisible-region weight inside split density loss. 1.0 reproduces previous full-map MSE.",
+        default=None,
+        help="Invisible-region weight inside split density loss. Default: 1.0, "
+        "or 3.0 when --mask-mode=inpaint and masking is enabled (invisible region "
+        "is small; needs stronger gradient to drive hallucination).",
+    )
+    parser.add_argument(
+        "--invisible-density-norm",
+        type=str,
+        default="region_mean",
+        choices=["region_mean", "area_scaled"],
+        help="How to normalize per-region density MSE. 'region_mean' divides each "
+        "region's SSE by its pixel count (area-invariant; current behavior). "
+        "'area_scaled' divides both by total pixels, so the invisible term's "
+        "magnitude scales with the mask area fraction -- stronger hallucination "
+        "gradient on large masks.",
     )
     parser.add_argument(
         "--invisible-count-weight",
@@ -168,6 +196,13 @@ def parse_args() -> argparse.Namespace:
         help="Fraction of object instances to mask per image (0..1), or None to disable masking.",
     )
     parser.add_argument(
+        "--val-mask-ratio",
+        type=float,
+        default=0.3,
+        help="Masking ratio used by the hallucination-evaluation val loader "
+        "(A1 metrics). Deterministic per-sample; 0 disables masked val entirely.",
+    )
+    parser.add_argument(
         "--mask-mode",
         type=str,
         default="inpaint",
@@ -183,6 +218,17 @@ def parse_args() -> argparse.Namespace:
         help="Dot instance mask: 'box' rectangles; 'gaussian' uses CSRNet-sigma disks on the image "
         "and (with --mask-mode robust) subtracts each masked head's GT Gaussian from density "
         "instead of multiplying by (1 - mask).",
+    )
+    parser.add_argument(
+        "--mask-fill",
+        type=str,
+        default="imagenet_mean",
+        choices=["imagenet_mean", "zero", "noise", "learnable"],
+        help="B2: value used to fill masked image pixels. 'imagenet_mean' (default, "
+        "matches the dataset's pre-masking behavior and leaves normalized pixels at 0). "
+        "'zero' fills with literal pixel 0 (black). 'noise' fills with per-pixel N(0,1) "
+        "in normalized space. 'learnable' uses a (3,) model.mask_token parameter trained "
+        "end-to-end (MAE-style mask token).",
     )
     parser.add_argument(
         "--deterministic-masks",
@@ -359,7 +405,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vit-init-checkpoint",
         type=str,
-        default="trained_models/vit/vit-shng-part_A-0.3-inpaint-gaussian-random/vit-shng-0.3-inpaint-gaussian-random-best.pth",
+        # default="trained_models/vit/vit-shng-part_A-0.3-inpaint-gaussian-random/vit-shng-0.3-inpaint-gaussian-random-best.pth",
+        default="",
         help="Optional checkpoint used to initialize ViT before training. "
         "Set to empty string to disable explicit init checkpoint loading.",
     )
@@ -378,6 +425,20 @@ if __name__ == "__main__":
     args = parse_args()
     if args.lr is None:
         args.lr = 1e-7 if args.model == "csrnet" else 1e-6
+
+    train_uses_masking = args.mask_ratio is not None and args.mask_ratio > 0
+
+    # A3: bump invisible density weight default for inpaint hallucination runs.
+    if args.invisible_density_weight is None:
+        if train_uses_masking and args.mask_mode == "inpaint":
+            args.invisible_density_weight = 3.0
+            print(
+                "No --invisible-density-weight provided; defaulting to 3.0 for "
+                "inpaint hallucination (the invisible region is small -- bump the "
+                "gradient). Pass --invisible-density-weight 1.0 to restore prior behavior."
+            )
+        else:
+            args.invisible_density_weight = 1.0
     if args.model == "vit" and args.optimizer == "sgd":
         warnings.warn(
             "ViT fine-tuning with SGD often plateaus; prefer --optimizer adam.",
@@ -586,13 +647,35 @@ if __name__ == "__main__":
             **dataset_kwargs,
             split="test_data",
             mask_object_ratio=None,
-            # mask_object_ratio=args.mask_ratio,
-            # mask_mode=args.mask_mode,
-            # mask_dot_style=args.mask_dot_style,
             transform=eval_transform,
         )
 
-    print(f"Train: {len(train_dataset)} samples, Val: {len(val_dataset)} samples")
+    # A1: masked val set. Inpaint mode (density stays full), fixed seed so the same
+    # holes appear every epoch -- apples-to-apples hallucination tracking.
+    masked_val_dataset = None
+    if (
+        not args.single_image
+        and not args.no_validation
+        and args.val_mask_ratio is not None
+        and args.val_mask_ratio > 0
+    ):
+        masked_val_dataset = load_shanghaitech_dataset(
+            **dataset_kwargs,
+            split="test_data",
+            mask_object_ratio=float(args.val_mask_ratio),
+            mask_mode="inpaint",
+            mask_dot_style=args.mask_dot_style,
+            deterministic_masks=True,
+            mask_seed=0,
+            mask_dot_box_aspect=(3, 1),
+            mask_dot_sigma_to_box=4.0,
+            transform=eval_transform,
+        )
+
+    print(
+        f"Train: {len(train_dataset)} samples, Val: {len(val_dataset)} samples"
+        + (f", Masked-val: {len(masked_val_dataset)} samples" if masked_val_dataset is not None else "")
+    )
 
     
 
@@ -601,12 +684,14 @@ if __name__ == "__main__":
         count_loss_weight=args.count_loss_weight,
         invisible_density_weight=args.invisible_density_weight,
         invisible_count_weight=args.invisible_count_weight,
+        invisible_density_norm=args.invisible_density_norm,
         model_name=args.model,
         data_name=args.data_name,
         mask_ratio=args.mask_ratio,
         mask_mode=args.mask_mode,
         mask_dot_style=args.mask_dot_style,
         mask_sampling_mode=mask_sampling_mode,
+        mask_fill=args.mask_fill,
         output_dir=args.output_dir,
         early_stopping_patience=args.early_stopping_patience,
         density_scale=args.density_scale,
@@ -637,7 +722,7 @@ if __name__ == "__main__":
         train_kw["tiled_val_overlap"] = args.tiled_val_overlap
         train_kw["tiled_val_max_batch"] = args.tiled_val_max_batch
 
-    train(model, train_dataset, val_dataset, **train_kw)
+    train(model, train_dataset, val_dataset, masked_val_dataset=masked_val_dataset, **train_kw)
 
    
     

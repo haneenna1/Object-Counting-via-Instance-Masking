@@ -1307,6 +1307,7 @@ def visualize_image_and_density(
 
     # Save to file when requested (useful on headless/SSH setups).
     if save_dir is not None:
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
         # Same base image → same stem; patch wrapper needs flat_idx so files do not overwrite.
         if patch_ds is not None:
             save_path = Path(save_dir) / f"{name_stem}_patch{flat_idx:05d}.png"
