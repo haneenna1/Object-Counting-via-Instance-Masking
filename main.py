@@ -198,7 +198,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--val-mask-ratio",
         type=float,
-        default=0.3,
+        default=0.0,
         help="Masking ratio used by the hallucination-evaluation val loader "
         "(A1 metrics). Deterministic per-sample; 0 disables masked val entirely.",
     )
@@ -357,7 +357,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--optimizer",
         type=str,
-        default="sgd",
+        default="adam",
         choices=["sgd", "adam"],
         help="Optimizer type.",
     )

@@ -7,7 +7,6 @@ if str(_REPO_ROOT) not in sys.path:
 
 import argparse
 import json
-from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,19 +18,35 @@ from tqdm import tqdm
 
 from data.dataset import DENSITY_MAP_DIR_AUTO
 from data.shanghaitech import load_shanghaitech_dataset
-from data.transforms import timm_eval_dict_transform
+from data.transforms import vit_normalize_only_transform
 from inference.evaluate import _build_model
+from training.train import extract_vit_latent_tiled
 
 
 @torch.no_grad()
-def extract_latent_batch(model: torch.nn.Module, images: torch.Tensor, model_name: str) -> torch.Tensor:
+def extract_latent_batch(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    model_name: str,
+    vit_tile_size: int = 224,
+    vit_tile_overlap: int = 48,
+    vit_tile_max_batch: int = 16,
+) -> torch.Tensor:
     """
     Return one latent vector per image: shape (B, D).
     """
     if model_name == "vit":
-        tokens = model.encoder.forward_features(images)
-        tokens = tokens[:, model.num_prefix_tokens :, :]
-        return tokens.mean(dim=1)
+        latent_list = [
+            extract_vit_latent_tiled(
+                model,
+                image,
+                tile_size=vit_tile_size,
+                overlap=vit_tile_overlap,
+                max_batch=vit_tile_max_batch,
+            )
+            for image in images
+        ]
+        return torch.stack(latent_list, dim=0)
 
     if model_name == "unet":
         e1 = model.enc1(images)
@@ -61,7 +76,7 @@ def extract_latent_batch(model: torch.nn.Module, images: torch.Tensor, model_nam
 
 
 def build_dataset(args: argparse.Namespace, model: torch.nn.Module):
-    eval_transform = timm_eval_dict_transform(model.encoder) if args.model == "vit" else None
+    eval_transform = vit_normalize_only_transform(model.encoder) if args.model == "vit" else None
     return load_shanghaitech_dataset(
         root=args.data_root,
         part=[args.part],
@@ -94,7 +109,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deterministic-masks", action="store_true")
     parser.add_argument("--mask-seed", type=int, default=None)
     parser.add_argument("--freeze-encoder", action="store_true")
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-samples", type=int, default=800)
     parser.add_argument("--perplexity", type=float, default=30.0)
@@ -103,6 +118,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-root", type=str, default="latent_studies/results")
     parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--vit-tile-size", type=int, default=224)
+    parser.add_argument("--vit-tile-overlap", type=int, default=48)
+    parser.add_argument("--vit-tile-max-batch", type=int, default=16)
     return parser.parse_args()
 
 
@@ -110,9 +128,7 @@ def make_output_dir(args: argparse.Namespace) -> Path:
     if args.run_name:
         run_name = args.run_name
     else:
-        checkpoint_stem = Path(args.checkpoint).stem
-        date_tag = datetime.now().strftime("%d-%m-%H")
-        run_name = f"{checkpoint_stem}-{args.model}-{args.part}-{args.split}-{date_tag}"
+        run_name = Path(args.checkpoint).stem
     out_dir = Path(args.output_root) / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
@@ -144,7 +160,14 @@ def main() -> None:
     pbar = tqdm(loader, desc="Extracting latents")
     for batch in pbar:
         images = batch["image"].to(device)
-        batch_latent = extract_latent_batch(model, images, args.model).detach().cpu().numpy()
+        batch_latent = extract_latent_batch(
+            model,
+            images,
+            args.model,
+            vit_tile_size=args.vit_tile_size,
+            vit_tile_overlap=args.vit_tile_overlap,
+            vit_tile_max_batch=args.vit_tile_max_batch,
+        ).detach().cpu().numpy()
         batch_count = batch["count"].detach().cpu().numpy()
         latents.append(batch_latent)
         counts.append(batch_count)
@@ -215,7 +238,7 @@ def main() -> None:
         "tsne_npz": str(out_dir / "tsne_data.npz"),
         "plot_path": str(out_dir / "tsne_scatter_by_count.png"),
     }
-    with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
+    with (out_dir / "tsne_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     print(f"Saved t-SNE outputs to {out_dir}")
