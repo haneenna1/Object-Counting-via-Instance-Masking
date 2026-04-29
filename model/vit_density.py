@@ -39,6 +39,7 @@ class ViTDensity(nn.Module):
         freeze_encoder: bool = False,
         output_activation: str = "none",
         linear_probe: bool = False,
+        hidden_count_aux: bool = False,
     ):
         super().__init__()
         if output_activation not in ("relu", "softplus", "none"):
@@ -80,7 +81,31 @@ class ViTDensity(nn.Module):
         # regardless of the fill mode in use at train time.
         self.mask_token = nn.Parameter(torch.zeros(3))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Encoder-only inpainting auxiliary head. Consumes ONE patch token and
+        # predicts the per-pixel density inside that token's p x p patch. The
+        # output is a flat p*p vector that the aux loss reshapes into a
+        # sub-patch density map and supervises (weighted MSE) only at hidden
+        # pixels (mask > 0) of patches whose mask coverage exceeds a threshold.
+        # With no spatial mixing across tokens and no decoder in the path,
+        # gradient can only reduce by pushing hidden-density information into
+        # the encoder token at the masked position -- closing the "decoder
+        # smoothes the hole" shortcut. See training.train for the loss.
+        self.hidden_count_aux = bool(hidden_count_aux)
+        if self.hidden_count_aux:
+            self.aux_head = nn.Linear(
+                self.embed_dim, self.patch_size * self.patch_size
+            )
+        else:
+            self.aux_head = None
+
+    def forward(self, x: torch.Tensor, return_tokens: bool = False):
+        """Forward pass.
+
+        When ``return_tokens=True`` the call additionally returns the patch
+        tokens straight out of the encoder (before the conv decoder reshape)
+        plus the patch-grid shape ``(h, w)``. This is used by the encoder-only
+        inpainting auxiliary head; the default behaviour is unchanged.
+        """
         B, _, H, W = x.shape
 
         p = self.patch_size
@@ -91,12 +116,12 @@ class ViTDensity(nn.Module):
             x = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
         H_pad, W_pad = x.shape[-2:]
 
-        features = self.encoder.forward_features(x)
-        features = features[:, self.num_prefix_tokens:, :]
+        tokens = self.encoder.forward_features(x)
+        tokens = tokens[:, self.num_prefix_tokens:, :]  # (B, N, D), N=h*w
 
         h = H_pad // p
         w = W_pad // p
-        features = features.transpose(1, 2).reshape(B, self.embed_dim, h, w)
+        features = tokens.transpose(1, 2).reshape(B, self.embed_dim, h, w)
 
         density = self.decoder(features)
         if self.linear_probe:
@@ -113,4 +138,6 @@ class ViTDensity(nn.Module):
         elif self._output_activation == "softplus":
             density = F.softplus(density)
 
+        if return_tokens:
+            return density, tokens, (h, w)
         return density

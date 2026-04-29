@@ -188,6 +188,30 @@ def build_optimizer_param_groups(
             }
         )
 
+    # Encoder-only inpainting auxiliary head (1 linear layer, see ViTDensity).
+    # Treated as a small head: decoder-side learning rate, but with weight decay
+    # because it's a non-bias matmul. Only added when the model was constructed
+    # with hidden_count_aux=True; otherwise the attribute is None.
+    aux_head = getattr(module, "aux_head", None)
+    if aux_head is not None:
+        aux_decay: list[torch.nn.Parameter] = []
+        aux_no_decay: list[torch.nn.Parameter] = []
+        for name, param in aux_head.named_parameters():
+            if not param.requires_grad:
+                continue
+            if _param_skips_weight_decay(name, param):
+                aux_no_decay.append(param)
+            else:
+                aux_decay.append(param)
+        if aux_no_decay:
+            groups.append(
+                {"params": aux_no_decay, "lr": dec_lr, "weight_decay": 0.0, "group_name": "aux_head_no_decay"}
+            )
+        if aux_decay:
+            groups.append(
+                {"params": aux_decay, "lr": dec_lr, "weight_decay": weight_decay, "group_name": "aux_head_decay"}
+            )
+
     if not groups:
         raise RuntimeError("No trainable parameters in module for optimizer groups.")
     return groups
@@ -482,6 +506,88 @@ def _split_counts_by_mask(
 
 
 # -----------------------------
+# Encoder-only inpainting auxiliary loss (per-patch density reconstruction)
+# -----------------------------
+def _compute_aux_hidden_density_loss(
+    tokens: torch.Tensor,            # (B, N, D)  encoder patch tokens
+    patch_grid: tuple[int, int],     # (h, w)     N == h*w
+    aux_head: torch.nn.Module,       # nn.Linear(D, p*p)
+    gt_density: torch.Tensor,        # (B, 1, H, W) raw, sum-preserving
+    mask: torch.Tensor,              # (B, 1, H, W) in [0, 1]
+    patch_size: int,
+    patch_mask_threshold: float = 0.5,
+) -> torch.Tensor:
+    """
+    Encoder-only inpainting auxiliary loss (per-patch density reconstruction).
+
+    For each patch whose mask coverage exceeds ``patch_mask_threshold``, the
+    aux head consumes the SINGLE encoder token at that position and outputs a
+    flat p*p vector that we reshape into a p x p sub-patch density map. The
+    loss is a weighted MSE against GT density, weighted by the per-pixel
+    ``mask`` value so only the *hidden* sub-region of each masked patch is
+    supervised (continuous in [0,1] for Gaussian masks, binary for box masks).
+    Because the predictor is a single linear layer with no spatial mixing
+    across tokens and no decoder in the path, gradient can only reduce by
+    pushing hidden-density information into the encoder token at the masked
+    position -- closes the "decoder smoothes the hole" shortcut.
+
+    Returns a scalar weighted MSE in raw density^2 units. Safely returns 0
+    (still on the autograd graph through ``aux_head``) when no patch in the
+    batch is sufficiently masked.
+    """
+    B, N, D = tokens.shape
+    h, w = patch_grid
+    if N != h * w:
+        raise ValueError(
+            f"aux loss: tokens N={N} but patch grid {h}x{w} = {h*w}"
+        )
+    p = patch_size
+    H_pad, W_pad = h * p, w * p
+    H, W = gt_density.shape[-2:]
+
+    # The encoder reflect-pads the input image to a multiple of ``p``; for the
+    # AUX target we want zero density and zero mask in the padded region so
+    # reflected density does not leak into the per-patch supervision.
+    if (H, W) != (H_pad, W_pad):
+        pad_h_amt = max(0, H_pad - H)
+        pad_w_amt = max(0, W_pad - W)
+        if pad_h_amt > 0 or pad_w_amt > 0:
+            gt_density = F.pad(gt_density, (0, pad_w_amt, 0, pad_h_amt), value=0.0)
+            mask = F.pad(mask, (0, pad_w_amt, 0, pad_h_amt), value=0.0)
+        if H > H_pad or W > W_pad:
+            gt_density = gt_density[..., :H_pad, :W_pad]
+            mask = mask[..., :H_pad, :W_pad]
+
+    mask = mask.clamp(0.0, 1.0)
+
+    # Per-token p*p prediction -> spatial sub-patch density map.
+    # Pred layout: (B, N, p*p) with N = h*w in row-major (token i = (hi, wi)).
+    # Spatial layout we want: (B, 1, h*p, w*p) so that pixel (y, x) =
+    # patch (y//p, x//p) at offset (y%p, x%p). Reshape via:
+    #   (B, h, w, p, p) -> permute to (B, h, p, w, p) -> view (B, 1, h*p, w*p).
+    pred = aux_head(tokens)                          # (B, N, p*p)
+    pred = pred.view(B, h, w, p, p)
+    pred = pred.permute(0, 1, 3, 2, 4).contiguous()  # (B, h, p, w, p)
+    pred = pred.view(B, 1, h * p, w * p)
+
+    # Patch-level gate: which patches count as "masked" for supervision.
+    patch_mask_frac = F.avg_pool2d(mask, p)                       # (B, 1, h, w)
+    patch_sel = (patch_mask_frac > patch_mask_threshold).to(mask.dtype)
+    pixel_patch_sel = F.interpolate(patch_sel, scale_factor=p, mode="nearest")
+
+    # Hidden-only supervision: weight = patch gate * per-pixel mask. This is
+    # 0 outside masked patches, and inside masked patches it is the mask
+    # value at that pixel (continuous for Gaussian masks, binary for box).
+    weight = pixel_patch_sel * mask
+    sse = ((pred - gt_density) ** 2 * weight).sum()
+    # ``clamp(min=1.0)`` makes empty-batch behaviour numerically safe: if
+    # ``weight.sum() == 0`` then ``sse`` is also 0, so the loss is 0 with
+    # gradient flowing through ``pred`` (and hence through aux_head).
+    denom = weight.sum().clamp(min=1.0)
+    return sse / denom
+
+
+# -----------------------------
 # Train for one epoch
 # -----------------------------
 def train_one_epoch(
@@ -498,16 +604,29 @@ def train_one_epoch(
     gt_downsample: str = "bilinear",
     mask_mode: str | None = None,
     mask_fill: str = "imagenet_mean",
+    aux_loss_weight: float = 0.0,
+    aux_patch_threshold: float = 0.5,
     max_grad_norm: float | None = 1.0,
 ):
 
     model.train()
+
+    aux_head = getattr(model, "aux_head", None)
+    use_aux = (
+        aux_loss_weight > 0.0
+        and aux_head is not None
+        and getattr(model, "hidden_count_aux", False)
+        and mask_mode == "inpaint"
+    )
+    aux_patch_size = int(getattr(model, "patch_size", 16)) if use_aux else 0
 
     total_loss = 0.0
     total_mse = 0.0
     total_mae = 0.0
     total_mae_vis = 0.0
     total_mae_inv = 0.0
+    total_aux_loss = 0.0
+    aux_samples = 0  # batches that contributed a non-zero aux loss
     inv_samples = 0  # only count samples where mask is actually non-empty
     total_samples = 0
 
@@ -524,7 +643,10 @@ def train_one_epoch(
 
         optimizer.zero_grad()
 
-        pred_density = model(images)
+        if use_aux:
+            pred_density, tokens, patch_grid = model(images, return_tokens=True)
+        else:
+            pred_density = model(images)
 
         loss, mse = compute_loss(
             pred_density,
@@ -539,6 +661,20 @@ def train_one_epoch(
             mask_mode=mask_mode,
             invisible_density_norm=invisible_density_norm,
         )
+
+        aux_loss_value = 0.0
+        if use_aux:
+            aux_loss = _compute_aux_hidden_density_loss(
+                tokens=tokens,
+                patch_grid=patch_grid,
+                aux_head=aux_head,
+                gt_density=gt_density,
+                mask=mask,
+                patch_size=aux_patch_size,
+                patch_mask_threshold=aux_patch_threshold,
+            )
+            loss = loss + aux_loss_weight * aux_loss
+            aux_loss_value = float(aux_loss.detach().item())
         with torch.no_grad():
             pred_count, gt_count = _counts_from_densities(
                 pred_density, gt_density, density_scale, gt_downsample=gt_downsample
@@ -568,6 +704,9 @@ def train_one_epoch(
         if mask_has_any.any():
             total_mae_inv += inv_abs[mask_has_any].sum().item()
             inv_samples += int(mask_has_any.sum().item())
+        if use_aux:
+            total_aux_loss += aux_loss_value * batch_size
+            aux_samples += batch_size
         total_samples += batch_size
 
     avg_loss = total_loss / total_samples
@@ -575,6 +714,7 @@ def train_one_epoch(
     avg_mae = total_mae / total_samples
     avg_mae_vis = total_mae_vis / total_samples
     avg_mae_inv = total_mae_inv / inv_samples if inv_samples > 0 else 0.0
+    avg_aux_loss = total_aux_loss / aux_samples if aux_samples > 0 else 0.0
 
     return {
         "loss": avg_loss,
@@ -583,6 +723,8 @@ def train_one_epoch(
         "mae_visible": avg_mae_vis,
         "mae_invisible": avg_mae_inv,
         "invisible_sample_count": inv_samples,
+        "aux_loss": avg_aux_loss,
+        "aux_active": bool(use_aux),
     }
 
 
@@ -905,6 +1047,15 @@ def plot_training_curves(history, save_path: str | Path):
         ax.plot(epochs, history["train_mae_invisible"], label="Train MAE (invisible)", linestyle="--")
     if history["val_mae"]:
         ax.plot(epochs, history["val_mae"], label="Val MAE (clean)", color="black")
+    aux_hist = history.get("train_aux_loss") or []
+    if aux_hist and any(v != 0.0 for v in aux_hist):
+        # Aux loss lives on a different scale (weighted MSE on hidden-region
+        # density per masked patch), so plot on a twin y-axis to keep the
+        # main MAE / total-loss curves readable.
+        ax_aux = ax.twinx()
+        ax_aux.plot(epochs, aux_hist, color="tab:purple", linestyle="-.", label="Train aux loss (hidden-density)")
+        ax_aux.set_ylabel("Aux loss")
+        ax_aux.legend(loc="upper right", fontsize=8)
     ax.set_ylabel("Metric")
     ax.set_title("Training Curves")
     ax.legend(loc="best", fontsize=8)
@@ -972,6 +1123,8 @@ def train(
     tiled_val_tile: int = 224,
     tiled_val_overlap: int = 48,
     tiled_val_max_batch: int = 16,
+    aux_loss_weight: float = 0.0,
+    aux_patch_threshold: float = 0.5,
 ):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1078,13 +1231,26 @@ def train(
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)
         # Tolerate missing keys that were added after this checkpoint was saved
-        # (e.g. ``mask_token``); unexpected keys are still an error.
+        # (e.g. ``mask_token``, ``aux_head.*``). Unexpected keys are tolerated
+        # only when they belong to optional, opt-in heads that the current
+        # model does not include (so resuming a hidden-count-aux checkpoint
+        # into a non-aux model still works for representation probing).
         missing, unexpected = model.load_state_dict(
             ckpt["model_state_dict"], strict=False
         )
-        if unexpected:
+        unexpected_optional = {"mask_token"}
+        unexpected_real = [
+            k for k in unexpected
+            if k not in unexpected_optional and not k.startswith("aux_head.")
+        ]
+        if unexpected_real:
             raise RuntimeError(
-                f"Unexpected keys in resume checkpoint {resume_path}: {unexpected[:8]}"
+                f"Unexpected keys in resume checkpoint {resume_path}: {unexpected_real[:8]}"
+            )
+        if unexpected:
+            print(
+                f"Resume {resume_path}: dropping checkpoint keys absent in current "
+                f"model (e.g. aux head from a different config): {unexpected}."
             )
         if missing:
             print(
@@ -1137,6 +1303,7 @@ def train(
         "train_mse": [],
         "train_mae_visible": [],
         "train_mae_invisible": [],
+        "train_aux_loss": [],
         "val_mae": [],
         "val_mae_total_masked": [],
         "val_mae_hidden": [],
@@ -1189,6 +1356,14 @@ def train(
             mask_str = f"{mask_str}-{mask_dot_style}"
         mask_str = f"{mask_str}-{mask_sampling_mode}"
     run_name = f"{model_name}-{data_name}-{mask_str}"
+    if (
+        aux_loss_weight > 0.0
+        and getattr(model, "hidden_count_aux", False)
+        and mask_mode == "inpaint"
+    ):
+        # Distinguish runs with the encoder-only auxiliary head so checkpoints,
+        # curve plots, and history files don't clash with non-aux baselines.
+        run_name = f"{run_name}-aux{aux_loss_weight:g}"
     
     # output_dir = Path(output_dir) / model_name / run_name
     # output_dir.mkdir(parents=True, exist_ok=True)
@@ -1254,6 +1429,8 @@ def train(
             gt_downsample=gt_downsample,
             mask_mode=mask_mode,
             mask_fill=mask_fill,
+            aux_loss_weight=aux_loss_weight,
+            aux_patch_threshold=aux_patch_threshold,
             max_grad_norm=max_grad_norm,
         )
         train_loss = train_metrics["loss"]
@@ -1262,6 +1439,8 @@ def train(
         train_mae_vis = train_metrics["mae_visible"]
         train_mae_inv = train_metrics["mae_invisible"]
         inv_samp = train_metrics["invisible_sample_count"]
+        train_aux_loss = train_metrics.get("aux_loss", 0.0)
+        aux_active = train_metrics.get("aux_active", False)
         count_loss_weight = count_weight_controller.update(epoch, train_mse)         # Step the scheduler to update the LR
         print(f"Epoch {epoch:03d} | Count loss weight: {count_loss_weight:.4f}")
         lr_scheduler.step()
@@ -1309,6 +1488,7 @@ def train(
         history["train_mse"].append(train_mse)
         history["train_mae_visible"].append(train_mae_vis)
         history["train_mae_invisible"].append(train_mae_inv)
+        history["train_aux_loss"].append(train_aux_loss)
         if val_mae is not None:
             history["val_mae"].append(val_mae)
         if masked_val_metrics is not None:
@@ -1350,6 +1530,10 @@ def train(
                 )
             else:
                 masked_str = ""
+            aux_str = (
+                f"aux_loss {train_aux_loss:.4f} (w={aux_loss_weight:g}) | "
+                if aux_active else ""
+            )
             print(
                 f"Epoch {epoch:03d} | "
                 f"lr {lr_str} | "
@@ -1358,6 +1542,7 @@ def train(
                 f"weighted train mae {train_mae*count_loss_weight:.4f} | "
                 f"train mse {train_mse:.4f} | "
                 f"total loss {train_loss:.4f} | "
+                f"{aux_str}"
                 f"Val MAE {val_mae:.4f} | "
                 f"{masked_str}"
                 f"Best MAE {best_mae:.4f}"

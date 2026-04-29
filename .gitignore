@@ -5,3 +5,7 @@ vis/
 ShanghaiTech/
 trained_models/
 inference/results
+latent_studies/results
+studies
+nohup*
+*.out

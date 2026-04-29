@@ -1,5 +1,6 @@
 from pathlib import Path
 import argparse
+import shlex
 import sys
 import warnings
 from datetime import datetime
@@ -62,17 +63,31 @@ def _load_vit_init_weights(
 
     if mode == "full":
         # Tolerate missing keys that were added after the checkpoint was saved
-        # (e.g. B2's ``mask_token``); fail loudly on unexpected keys.
+        # (e.g. B2's ``mask_token`` and the encoder-only ``aux_head.*``).
+        # Tolerate unexpected ``aux_head.*`` so an aux-trained checkpoint can
+        # be loaded into a model built without --hidden-count-aux (e.g. for
+        # representation probing where the head is unused).
         missing, unexpected = model.load_state_dict(state, strict=False)
         ok_missing = {"mask_token"}
-        real_missing = [k for k in missing if k not in ok_missing]
+        real_missing = [
+            k for k in missing
+            if k not in ok_missing and not k.startswith("aux_head.")
+        ]
+        real_unexpected = [
+            k for k in unexpected if not k.startswith("aux_head.")
+        ]
         if real_missing:
             raise RuntimeError(
                 f"Missing keys while loading full ViT checkpoint from {path}: {real_missing[:8]}"
             )
-        if unexpected:
+        if real_unexpected:
             raise RuntimeError(
-                f"Unexpected keys while loading full ViT checkpoint from {path}: {unexpected[:8]}"
+                f"Unexpected keys while loading full ViT checkpoint from {path}: {real_unexpected[:8]}"
+            )
+        if unexpected:
+            print(
+                f"Loaded full ViT checkpoint from {path}; dropping aux/optional keys "
+                f"absent in current model: {unexpected}."
             )
         if missing:
             print(f"Loaded full ViT checkpoint from {path}; initialized {missing} from scratch.")
@@ -122,8 +137,21 @@ class _Tee:
         self.log_file.flush()
 
 
+class _ArgsFromFileParser(argparse.ArgumentParser):
+    """ArgumentParser that supports `@args.txt` with shell-like tokenization."""
+
+    def convert_arg_line_to_args(self, arg_line: str):
+        stripped = arg_line.strip()
+        if not stripped or stripped.startswith("#"):
+            return []
+        return shlex.split(stripped, comments=True)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train density estimation models.")
+    parser = _ArgsFromFileParser(
+        description="Train density estimation models.",
+        fromfile_prefix_chars="@",
+    )
     parser.add_argument(
         "--model",
         type=str,
@@ -153,10 +181,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--invisible-density-weight",
         type=float,
-        default=None,
+        default=1.0,
         help="Invisible-region weight inside split density loss. Default: 1.0, "
-        "or 3.0 when --mask-mode=inpaint and masking is enabled (invisible region "
-        "is small; needs stronger gradient to drive hallucination).",
     )
     parser.add_argument(
         "--invisible-density-norm",
@@ -418,6 +444,39 @@ def parse_args() -> argparse.Namespace:
         help="'full': load full ViTDensity state_dict. "
         "'backbone': load only encoder.* weights (useful with --linear-probe).",
     )
+    parser.add_argument(
+        "--hidden-count-aux",
+        action="store_true",
+        help="ViT only: add an encoder-only auxiliary head that, from a SINGLE "
+        "masked patch token (no spatial mixing, no decoder), reconstructs the "
+        "per-pixel density inside that token's p x p patch. Supervision is a "
+        "weighted MSE against GT density inside the *hidden* sub-region only "
+        "(weight = per-pixel mask), summed only over patches with mask "
+        "coverage > --aux-patch-threshold. Active only when --mask-mode=inpaint "
+        "and --aux-loss-weight > 0. Forces the encoder (not the decoder) to "
+        "encode hidden density in its masked-patch tokens, routing inpainting "
+        "gradient directly to the encoder and closing the 'decoder smoothes the "
+        "hole' shortcut. (Flag name is historical -- the head predicts density, "
+        "not a scalar count.)",
+    )
+    parser.add_argument(
+        "--aux-loss-weight",
+        type=float,
+        default=0.1,
+        help="Weight on the encoder-only inpainting aux loss (weighted MSE on "
+        "hidden density inside masked patches; same units as the main raw-density "
+        "MSE). Ignored unless --hidden-count-aux is set. Default 0.1; sweep "
+        "{0.01, 0.1, 1.0} during ablation. Set to 0 to disable the loss while "
+        "still building the head (e.g. for loading aux-trained checkpoints).",
+    )
+    parser.add_argument(
+        "--aux-patch-threshold",
+        type=float,
+        default=0.5,
+        help="Patch-level coverage fraction (in [0,1]) above which a patch is "
+        "considered 'masked' for the aux loss. Lower (0.0) includes boundary "
+        "patches; higher (0.8) only well-covered ones. Default 0.5.",
+    )
     return parser.parse_args()
 
 
@@ -428,17 +487,6 @@ if __name__ == "__main__":
 
     train_uses_masking = args.mask_ratio is not None and args.mask_ratio > 0
 
-    # A3: bump invisible density weight default for inpaint hallucination runs.
-    if args.invisible_density_weight is None:
-        if train_uses_masking and args.mask_mode == "inpaint":
-            args.invisible_density_weight = 3.0
-            print(
-                "No --invisible-density-weight provided; defaulting to 3.0 for "
-                "inpaint hallucination (the invisible region is small -- bump the "
-                "gradient). Pass --invisible-density-weight 1.0 to restore prior behavior."
-            )
-        else:
-            args.invisible_density_weight = 1.0
     if args.model == "vit" and args.optimizer == "sgd":
         warnings.warn(
             "ViT fine-tuning with SGD often plateaus; prefer --optimizer adam.",
@@ -463,6 +511,33 @@ if __name__ == "__main__":
         # usually fails on decoder keys, so default to backbone-only loading.
         args.vit_init_load_mode = "backbone"
         print("Linear probe detected: switching --vit-init-load-mode to 'backbone'.")
+    if args.hidden_count_aux and args.model != "vit":
+        raise ValueError("--hidden-count-aux is only supported for --model vit.")
+    if args.hidden_count_aux and args.aux_loss_weight > 0.0 and args.mask_mode != "inpaint":
+        # The aux loss is meaningful only in the hallucination setting.
+        warnings.warn(
+            "--hidden-count-aux is enabled but --mask-mode is not 'inpaint'; "
+            "aux loss will be skipped at runtime.",
+            stacklevel=1,
+        )
+    if (
+        args.hidden_count_aux
+        and args.aux_loss_weight > 0.0
+        and (args.mask_ratio is None or args.mask_ratio == 0)
+    ):
+        warnings.warn(
+            "--hidden-count-aux is enabled but no instances are masked "
+            "(--mask-ratio is None or 0); aux loss will be a no-op every step.",
+            stacklevel=1,
+        )
+    if args.hidden_count_aux and args.freeze_encoder and args.unfreeze_backbone_after_epoch is None:
+        warnings.warn(
+            "--hidden-count-aux with a frozen encoder makes the aux head a pure "
+            "linear probe: gradient cannot reach the encoder, so it will not "
+            "shape the latent. Pass --unfreeze-backbone-after-epoch N to enable "
+            "the intended encoder-shaping effect.",
+            stacklevel=1,
+        )
     # Build log path: <output_dir>/<run_tag>/train-<date>.log
     mask_str = "nomsk" if args.mask_ratio is None else f"{args.mask_ratio}-{args.mask_mode or 'inpaint'}"
     if args.mask_ratio is not None and args.mask_dot_style != "box":
@@ -470,12 +545,16 @@ if __name__ == "__main__":
     mask_sampling_mode = "deterministic" if args.deterministic_masks else "random"
     if args.mask_ratio is not None:
         mask_str = f"{mask_str}-{mask_sampling_mode}"
-    run_tag = f"{args.model}-{args.data_name}-{args.data_part}-{mask_str}"
-    date_str = datetime.now().strftime("%Y-%m-%d-%Hh")
+    probe_tag = "-linprobe" if args.linear_probe else ""
+    run_tag = f"{args.model}-{args.data_name}-{args.data_part}-{mask_str}{probe_tag}"
+    now = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    hour_str = now.strftime("%Hh")
+    run_stamp = now.strftime("%Y-%m-%d-%Hh%Mm%Ss")
 
-    log_dir = Path(args.output_dir) / args.model / run_tag
+    log_dir = Path(args.output_dir) / args.model / run_tag / date_str / hour_str / run_stamp
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"train-{date_str}.log"
+    log_path = log_dir / f"train-{run_stamp}.log"
 
     log_file = open(log_path, "w")
     sys.stdout = _Tee(sys.stdout, log_file)
@@ -506,6 +585,7 @@ if __name__ == "__main__":
             freeze_encoder=args.freeze_encoder,
             output_activation="softplus",
             linear_probe=args.linear_probe,
+            hidden_count_aux=args.hidden_count_aux,
         )
         if args.vit_init_checkpoint:
             _load_vit_init_weights(
@@ -721,6 +801,10 @@ if __name__ == "__main__":
         )
         train_kw["tiled_val_overlap"] = args.tiled_val_overlap
         train_kw["tiled_val_max_batch"] = args.tiled_val_max_batch
+
+    if args.hidden_count_aux:
+        train_kw["aux_loss_weight"] = args.aux_loss_weight
+        train_kw["aux_patch_threshold"] = args.aux_patch_threshold
 
     train(model, train_dataset, val_dataset, masked_val_dataset=masked_val_dataset, **train_kw)
 
