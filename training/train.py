@@ -516,6 +516,8 @@ def _compute_aux_hidden_density_loss(
     mask: torch.Tensor,              # (B, 1, H, W) in [0, 1]
     patch_size: int,
     patch_mask_threshold: float = 0.5,
+    density_scale: float = DEFAULT_DENSITY_SCALE,
+    count_loss_weight: float = 1.0,
 ) -> torch.Tensor:
     """
     Encoder-only inpainting auxiliary loss (per-patch density reconstruction).
@@ -531,9 +533,13 @@ def _compute_aux_hidden_density_loss(
     pushing hidden-density information into the encoder token at the masked
     position -- closes the "decoder smoothes the hole" shortcut.
 
-    Returns a scalar weighted MSE in raw density^2 units. Safely returns 0
-    (still on the autograd graph through ``aux_head``) when no patch in the
-    batch is sufficiently masked.
+    Returns an auxiliary scalar:
+        hidden_density_mse + count_loss_weight * hidden_count_l1
+    where density supervision uses the same scaled-target convention as the
+    main density loss and hidden count is measured on the same supervised
+    region, in raw "heads" units with relative normalization.
+    Safely returns 0 (still on the autograd graph through ``aux_head``) when
+    no patch in the batch is sufficiently masked.
     """
     B, N, D = tokens.shape
     h, w = patch_grid
@@ -579,12 +585,23 @@ def _compute_aux_hidden_density_loss(
     # 0 outside masked patches, and inside masked patches it is the mask
     # value at that pixel (continuous for Gaussian masks, binary for box).
     weight = pixel_patch_sel * mask
-    sse = ((pred - gt_density) ** 2 * weight).sum()
+    gt_target = gt_density * density_scale
+    sse = ((pred - gt_target) ** 2 * weight).sum()
     # ``clamp(min=1.0)`` makes empty-batch behaviour numerically safe: if
     # ``weight.sum() == 0`` then ``sse`` is also 0, so the loss is 0 with
     # gradient flowing through ``pred`` (and hence through aux_head).
     denom = weight.sum().clamp(min=1.0)
-    return sse / denom
+    density_aux = sse / denom
+
+    pred_raw = pred / density_scale
+    pred_hidden_count = (pred_raw * weight).sum(dim=(1, 2, 3))
+    gt_hidden_count = (gt_density * weight).sum(dim=(1, 2, 3))
+    count_aux = (
+        torch.abs(pred_hidden_count - gt_hidden_count)
+        / gt_hidden_count.clamp_min(1.0)
+    ).mean()
+
+    return density_aux + float(count_loss_weight) * count_aux
 
 
 # -----------------------------
@@ -672,6 +689,8 @@ def train_one_epoch(
                 mask=mask,
                 patch_size=aux_patch_size,
                 patch_mask_threshold=aux_patch_threshold,
+                density_scale=density_scale,
+                count_loss_weight=count_loss_weight,
             )
             loss = loss + aux_loss_weight * aux_loss
             aux_loss_value = float(aux_loss.detach().item())
